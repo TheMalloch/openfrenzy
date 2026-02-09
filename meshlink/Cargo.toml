@@ -1,0 +1,24 @@
+[package]
+name = "meshlink"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tun = { version = "0.7", features = ["async"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+base64 = "0.22"
+bytes = "1"
+ipnet = { version = "2", features = ["serde"] }
+rand = "0.8"
+anyhow = "1"
+
+[dev-dependencies]
+base64 = "0.22"
+tokio = { version = "1", features = ["full", "test-util"] }
