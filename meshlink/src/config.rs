@@ -41,8 +41,13 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let contents =
             std::fs::read_to_string(path).with_context(|| format!("reading config {path:?}"))?;
+        Self::from_toml_string(&contents)
+    }
+
+    /// Parse a Config from a TOML string (used for server-delivered configs).
+    pub fn from_toml_string(s: &str) -> Result<Self> {
         let config: Config =
-            toml::from_str(&contents).with_context(|| format!("parsing config {path:?}"))?;
+            toml::from_str(s).context("parsing config TOML")?;
         config.validate()?;
         Ok(config)
     }

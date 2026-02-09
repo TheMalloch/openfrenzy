@@ -1,5 +1,7 @@
+mod api_client;
 mod cli;
 mod config;
+mod credentials;
 mod crypto;
 mod discovery;
 mod net;
@@ -44,20 +46,109 @@ async fn main() -> Result<()> {
             println!("Sending shutdown signal...");
             return Ok(());
         }
-        Some(Command::Up) | None => {
-            // Default: start the daemon
-            run_daemon(&cli.config).await?;
+        Some(Command::Register {
+            server,
+            invite,
+            name,
+        }) => {
+            return handle_register(&server, &invite, name.as_deref()).await;
+        }
+        Some(Command::Unregister { server }) => {
+            return handle_unregister(server.as_deref()).await;
+        }
+        Some(Command::Up {
+            server,
+            node_id,
+            auth_token,
+        }) => {
+            let server_params = cli::ServerParams::resolve(server, node_id, auth_token);
+            run_daemon(&cli.config, server_params).await?;
+        }
+        None => {
+            // Default: start the daemon with no server params
+            run_daemon(&cli.config, None).await?;
         }
     }
 
     Ok(())
 }
 
-async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
+/// Handle the `register` subcommand.
+async fn handle_register(server: &str, invite_code: &str, name: Option<&str>) -> Result<()> {
+    info!("registering with server {server}");
+
+    let client = api_client::ApiClient::new(server, None);
+    let resp = client.register(invite_code, name).await?;
+
+    // Save credentials
+    let creds = credentials::Credentials {
+        server: server.to_string(),
+        node_id: resp.node_id.clone(),
+        auth_token: resp.auth_token.clone(),
+    };
+    creds.save()?;
+
+    // Write the config file
+    let config_path = std::path::Path::new("/etc/meshlink/config.toml");
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent).context("creating /etc/meshlink")?;
+    }
+    std::fs::write(config_path, &resp.config_toml).context("writing config file")?;
+
+    println!("Registration successful!");
+    println!("  Node ID:    {}", resp.node_id);
+    println!("  Virtual IP: {}", resp.virtual_ip);
+    println!("  Public Key: {}", resp.public_key);
+    println!();
+    println!("Config written to /etc/meshlink/config.toml");
+    println!("Credentials saved to /etc/meshlink/credentials.json");
+    println!();
+    println!("Start the daemon with: sudo meshlink up");
+
+    Ok(())
+}
+
+/// Handle the `unregister` subcommand.
+async fn handle_unregister(server: Option<&str>) -> Result<()> {
+    let creds = credentials::Credentials::load()
+        .context("no credentials found — are you registered?")?;
+
+    let server_url = server.unwrap_or(&creds.server);
+    let client = api_client::ApiClient::new(server_url, Some(creds.auth_token.clone()));
+
+    client.unregister(&creds.node_id).await?;
+
+    // Clean up local files
+    let _ = std::fs::remove_file("/etc/meshlink/credentials.json");
+
+    println!("Node {} unregistered successfully.", creds.node_id);
+    Ok(())
+}
+
+async fn run_daemon(
+    config_path: &std::path::Path,
+    server_params: Option<cli::ServerParams>,
+) -> Result<()> {
     info!("MeshLink starting");
 
-    // Load configuration
-    let config = config::Config::load(config_path)?;
+    // If server mode, fetch config from API first
+    let config = if let Some(ref params) = server_params {
+        info!(server = %params.server, node_id = %params.node_id, "fetching config from server");
+        let client =
+            api_client::ApiClient::new(&params.server, Some(params.auth_token.clone()));
+        let config_toml = client.fetch_config(&params.node_id).await?;
+
+        // Write to disk for reference
+        if let Some(parent) = config_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(config_path, &config_toml);
+
+        config::Config::from_toml_string(&config_toml)?
+    } else {
+        config::Config::load(config_path)?
+    };
+
     info!(
         virtual_ip = %config.node.virtual_ip,
         listen_port = config.node.listen_port,
@@ -131,7 +222,7 @@ async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
 
     info!("spawning async tasks");
 
-    // Spawn all 6 tasks
+    // Spawn all tasks
     let tun_reader = tokio::spawn(tun::tun_reader_task(tun_read, channels.tun_to_router_tx));
 
     let tun_writer = tokio::spawn(tun::tun_writer_task(tun_write, channels.router_to_tun_rx));
@@ -171,6 +262,18 @@ async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
 
     let cli_listener = tokio::spawn(cli::cli_listener_task(shared_state.clone()));
 
+    // Spawn server heartbeat task if in server-orchestrated mode
+    let heartbeat_task = if let Some(params) = server_params {
+        Some(tokio::spawn(discovery::server_heartbeat_task(
+            shared_state.clone(),
+            params.server,
+            params.node_id,
+            params.auth_token,
+        )))
+    } else {
+        None
+    };
+
     info!("MeshLink running — press Ctrl+C to stop");
 
     // Wait for shutdown signal
@@ -189,6 +292,9 @@ async fn run_daemon(config_path: &std::path::Path) -> Result<()> {
     inbound_router.abort();
     discovery.abort();
     cli_listener.abort();
+    if let Some(ht) = heartbeat_task {
+        ht.abort();
+    }
 
     // Clean up socket file
     let _ = std::fs::remove_file(cli::socket_path());

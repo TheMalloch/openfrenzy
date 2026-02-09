@@ -21,7 +21,19 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Start the meshlink daemon.
-    Up,
+    Up {
+        /// Server HTTP base URL for dynamic config (e.g., http://coord.example.com:4001).
+        #[arg(long)]
+        server: Option<String>,
+
+        /// Node identifier (from registration).
+        #[arg(long)]
+        node_id: Option<String>,
+
+        /// Authentication token (from registration).
+        #[arg(long)]
+        auth_token: Option<String>,
+    },
     /// Stop the meshlink daemon.
     Down,
     /// Show current status and peers.
@@ -30,6 +42,78 @@ pub enum Command {
     Peers,
     /// Generate a new keypair.
     Genkey,
+    /// Register this node with a coordination server.
+    Register {
+        /// Server HTTP base URL (e.g., http://coord.example.com:4001).
+        #[arg(long)]
+        server: String,
+
+        /// Invite code from the server admin.
+        #[arg(long)]
+        invite: String,
+
+        /// Optional name for this node.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Unregister this node from the coordination server.
+    Unregister {
+        /// Server HTTP base URL.
+        #[arg(long)]
+        server: Option<String>,
+    },
+}
+
+/// Parameters for server-orchestrated mode, resolved from CLI args, credentials, or env vars.
+pub struct ServerParams {
+    pub server: String,
+    pub node_id: String,
+    pub auth_token: String,
+}
+
+impl ServerParams {
+    /// Resolve server params from CLI flags, falling back to stored credentials and env vars.
+    pub fn resolve(
+        server: Option<String>,
+        node_id: Option<String>,
+        auth_token: Option<String>,
+    ) -> Option<Self> {
+        // Try CLI args first
+        if let (Some(s), Some(n), Some(t)) = (server.clone(), node_id.clone(), auth_token.clone()) {
+            return Some(Self {
+                server: s,
+                node_id: n,
+                auth_token: t,
+            });
+        }
+
+        // Try env vars
+        let server = server
+            .or_else(|| std::env::var("MESHLINK_SERVER").ok());
+        let node_id = node_id
+            .or_else(|| std::env::var("MESHLINK_NODE_ID").ok());
+        let auth_token = auth_token
+            .or_else(|| std::env::var("MESHLINK_AUTH_TOKEN").ok());
+
+        if let (Some(s), Some(n), Some(t)) = (server.clone(), node_id.clone(), auth_token.clone()) {
+            return Some(Self {
+                server: s,
+                node_id: n,
+                auth_token: t,
+            });
+        }
+
+        // Try credentials file
+        if let Ok(creds) = crate::credentials::Credentials::load() {
+            return Some(Self {
+                server: server.unwrap_or(creds.server),
+                node_id: node_id.unwrap_or(creds.node_id),
+                auth_token: auth_token.unwrap_or(creds.auth_token),
+            });
+        }
+
+        None
+    }
 }
 
 /// Default path for the runtime control unix socket.

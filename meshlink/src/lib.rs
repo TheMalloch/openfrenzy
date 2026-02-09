@@ -1,5 +1,7 @@
+pub mod api_client;
 pub mod cli;
 pub mod config;
+pub mod credentials;
 pub mod crypto;
 pub mod discovery;
 pub mod net;

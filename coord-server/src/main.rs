@@ -1,3 +1,9 @@
+mod api;
+mod config_generator;
+mod db;
+mod ip_allocator;
+mod key_manager;
+
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -5,7 +11,7 @@ use std::time::Instant;
 use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
 
-/// A registered peer on the coordination server.
+/// A registered peer on the coordination server (in-memory UDP registry).
 #[derive(Debug, Clone)]
 struct RegisteredPeer {
     public_key: [u8; 32],
@@ -24,30 +30,92 @@ mod proto {
     pub const KEEPALIVE: u8 = 0x33;
 }
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("coord_server=info".parse().unwrap()),
+                .add_directive("coord_server=info".parse().unwrap())
+                .add_directive("tower_http=debug".parse().unwrap()),
         )
         .init();
 
-    let listen_addr = std::env::args()
+    // Load config from env vars
+    let database_url =
+        std::env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://localhost/meshlink".into());
+    let mesh_network = std::env::var("MESH_NETWORK").unwrap_or_else(|_| "10.0.0.0/24".into());
+    let http_port: u16 = std::env::var("HTTP_PORT")
+        .unwrap_or_else(|_| "4001".into())
+        .parse()
+        .context("parsing HTTP_PORT")?;
+    let udp_port: u16 = std::env::var("UDP_PORT")
+        .unwrap_or_else(|_| "4000".into())
+        .parse()
+        .context("parsing UDP_PORT")?;
+
+    // Also allow passing UDP address as CLI arg for backward compatibility
+    let udp_addr = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "0.0.0.0:4000".to_string());
+        .unwrap_or_else(|| format!("0.0.0.0:{udp_port}"));
 
-    let socket = UdpSocket::bind(&listen_addr)
+    // Connect to PostgreSQL and run migrations
+    let database = db::Db::connect(&database_url).await?;
+    database.migrate().await?;
+
+    // Set up IP allocator
+    let ip_allocator = ip_allocator::IpAllocator::new(&mesh_network)
+        .context("initializing IP allocator")?;
+
+    // Coordination server address that nodes should use in their config
+    let coord_server_addr = format!("0.0.0.0:{udp_port}");
+
+    // Build API state and router
+    let app_state = api::AppState {
+        db: database.clone(),
+        ip_allocator,
+        coord_server_addr,
+    };
+
+    let app = api::router(app_state);
+
+    // Start HTTP server
+    let http_addr: SocketAddr = format!("0.0.0.0:{http_port}").parse()?;
+    let http_listener = tokio::net::TcpListener::bind(http_addr).await?;
+    info!(%http_addr, "HTTP API server starting");
+
+    let http_server = tokio::spawn(async move {
+        if let Err(e) = axum::serve(http_listener, app).await {
+            warn!(error = %e, "HTTP server error");
+        }
+    });
+
+    // Start UDP coordination server (existing protocol handler)
+    let socket = UdpSocket::bind(&udp_addr)
         .await
-        .with_context(|| format!("binding to {listen_addr}"))?;
+        .with_context(|| format!("binding UDP to {udp_addr}"))?;
+    info!(listen_addr = %udp_addr, "UDP coordination server started");
 
-    info!(%listen_addr, "coordination server started");
+    // Background task: mark stale nodes in the database
+    let stale_db = database.clone();
+    let stale_checker = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            match stale_db.mark_stale_nodes(120).await {
+                Ok(count) if count > 0 => {
+                    info!(count, "marked stale nodes in database");
+                }
+                Err(e) => {
+                    warn!(error = %e, "failed to mark stale nodes");
+                }
+                _ => {}
+            }
+        }
+    });
 
-    // Peer table: public_key -> RegisteredPeer
+    // UDP event loop (existing logic)
     let mut peers: HashMap<[u8; 32], RegisteredPeer> = HashMap::new();
     let mut buf = vec![0u8; 4096];
-
-    // Periodic stale peer cleanup
     let mut cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(60));
 
     loop {
@@ -71,10 +139,18 @@ async fn main() -> Result<()> {
                 peers.retain(|_, p| p.last_seen > cutoff);
                 let removed = before - peers.len();
                 if removed > 0 {
-                    info!(removed, remaining = peers.len(), "cleaned stale peers");
+                    info!(removed, remaining = peers.len(), "cleaned stale UDP peers");
                 }
             }
         }
+    }
+
+    // These are unreachable but kept for completeness
+    #[allow(unreachable_code)]
+    {
+        http_server.abort();
+        stale_checker.abort();
+        Ok(())
     }
 }
 
@@ -86,7 +162,6 @@ async fn handle_message(
 ) {
     match data[0] {
         proto::NAT_DETECT_REQ => {
-            // Echo back the sender's observed endpoint
             handle_nat_detect(socket, src).await;
         }
         proto::REGISTER => {
@@ -107,12 +182,10 @@ async fn handle_message(
 async fn handle_nat_detect(socket: &UdpSocket, src: SocketAddr) {
     debug!(%src, "NAT detection request");
 
-    // Response: [0x11][ip: 4 bytes][port: 2 bytes]
     let mut resp = vec![proto::NAT_DETECT_RESP];
     match src.ip() {
         std::net::IpAddr::V4(ip) => resp.extend_from_slice(&ip.octets()),
         std::net::IpAddr::V6(_) => {
-            // Only support IPv4 for now
             warn!(%src, "IPv6 NAT detection not supported");
             return;
         }
@@ -125,7 +198,6 @@ async fn handle_nat_detect(socket: &UdpSocket, src: SocketAddr) {
 }
 
 fn handle_register(peers: &mut HashMap<[u8; 32], RegisteredPeer>, data: &[u8], src: SocketAddr) {
-    // [0x30][pub_key: 32][listen_port: 2]
     if data.len() < 35 {
         debug!(%src, "register message too short");
         return;
@@ -168,7 +240,6 @@ async fn handle_peer_list_req(
     let mut requester_key = [0u8; 32];
     requester_key.copy_from_slice(&data[1..33]);
 
-    // Build response with all peers except the requester
     let other_peers: Vec<&RegisteredPeer> = peers
         .values()
         .filter(|p| p.public_key != requester_key)
@@ -186,7 +257,6 @@ async fn handle_peer_list_req(
         match peer.endpoint.ip() {
             std::net::IpAddr::V4(ip) => resp.extend_from_slice(&ip.octets()),
             std::net::IpAddr::V6(_) => {
-                // Skip IPv6 peers for now
                 continue;
             }
         }
@@ -209,7 +279,7 @@ fn handle_keepalive(peers: &mut HashMap<[u8; 32], RegisteredPeer>, data: &[u8], 
 
     if let Some(peer) = peers.get_mut(&public_key) {
         peer.last_seen = Instant::now();
-        peer.endpoint = src; // Update in case endpoint changed
+        peer.endpoint = src;
         debug!(%src, "keepalive received");
     } else {
         debug!(%src, "keepalive from unknown peer");

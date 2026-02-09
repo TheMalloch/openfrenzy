@@ -11,3 +11,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 base64 = "0.22"
+axum = "0.8"
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+uuid = { version = "1", features = ["v4"] }
+rand = "0.8"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+ipnet = "2"
+toml = "0.8"
+chrono = { version = "0.4", features = ["serde"] }

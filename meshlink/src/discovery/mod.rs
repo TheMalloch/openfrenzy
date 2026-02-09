@@ -1,3 +1,4 @@
+use crate::api_client::ApiClient;
 use crate::crypto::handshake::{self, Identity};
 use crate::net::hole_punch;
 use crate::state::SharedState;
@@ -185,6 +186,91 @@ pub async fn discovery_task(
                 if let Err(e) = socket.send_to(&msg, coord_addr).await {
                     warn!(error = %e, "keepalive send failed");
                 }
+            }
+        }
+    }
+}
+
+/// Task: periodic heartbeat to the coordination server's REST API.
+/// If peers have changed, re-fetches the config and updates state.
+pub async fn server_heartbeat_task(
+    state: SharedState,
+    server_url: String,
+    node_id: String,
+    auth_token: String,
+) {
+    let client = ApiClient::new(&server_url, Some(auth_token));
+    let mut heartbeat_interval = interval(Duration::from_secs(30));
+
+    loop {
+        heartbeat_interval.tick().await;
+
+        match client.heartbeat(&node_id).await {
+            Ok(resp) => {
+                debug!(peers_changed = resp.peers_changed, "server heartbeat sent");
+
+                if resp.peers_changed {
+                    info!("peers changed, fetching updated config from server");
+
+                    match client.fetch_config(&node_id).await {
+                        Ok(config_toml) => {
+                            match crate::config::Config::from_toml_string(&config_toml) {
+                                Ok(config) => {
+                                    // Update peer state with new config
+                                    for peer_config in &config.peers {
+                                        let pub_key_bytes: [u8; 32] = match base64::Engine::decode(
+                                            &base64::engine::general_purpose::STANDARD,
+                                            &peer_config.public_key,
+                                        ) {
+                                            Ok(bytes) => match bytes.try_into() {
+                                                Ok(arr) => arr,
+                                                Err(_) => continue,
+                                            },
+                                            Err(_) => continue,
+                                        };
+
+                                        // Only add if not already known
+                                        if state.get_peer(&pub_key_bytes).await.is_none() {
+                                            let virtual_ip = peer_config
+                                                .allowed_ips
+                                                .first()
+                                                .map(|net| net.addr())
+                                                .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
+
+                                            let peer_info = crate::state::PeerInfo {
+                                                public_key: pub_key_bytes,
+                                                endpoint: peer_config.endpoint,
+                                                virtual_ip,
+                                                allowed_ips: peer_config.allowed_ips.clone(),
+                                                session_key: None,
+                                                last_handshake: None,
+                                                tx_bytes: 0,
+                                                rx_bytes: 0,
+                                            };
+                                            state.add_peer(peer_info).await;
+                                            info!(vip = %virtual_ip, "added new peer from server config");
+                                        }
+                                    }
+
+                                    // Write updated config to disk
+                                    let _ = std::fs::write(
+                                        "/etc/meshlink/config.toml",
+                                        &config_toml,
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "failed to parse updated config");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "failed to fetch updated config");
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "server heartbeat failed");
             }
         }
     }
