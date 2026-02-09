@@ -1,6 +1,6 @@
-# MeshLink Project Context
+# OpenFrenzy Project Context
 
-## What is MeshLink?
+## What is OpenFrenzy?
 A peer-to-peer LAN mesh networking tool written in Rust. It creates encrypted UDP tunnels between machines, making them appear on the same virtual LAN (e.g. `10.0.0.0/24`) regardless of their physical network location.
 
 ## Architecture
@@ -12,7 +12,7 @@ A peer-to-peer LAN mesh networking tool written in Rust. It creates encrypted UD
 ## Project Structure
 Two binaries in a workspace:
 
-### `meshlink/` — Node daemon (runs on each machine)
+### `OpenFrenzy/` — Node daemon (runs on each machine)
 - `src/main.rs` — entry point, tokio runtime, spawns async tasks
 - `src/config.rs` — TOML config parsing into typed structs
 - `src/state.rs` — shared runtime state: peer table, route table, stats (no mutex on hot path, use channels)
@@ -58,7 +58,7 @@ Inbound:  UDP recv → crypto decrypt → router lookup → TUN write
 private_key = "base64_encoded_key"
 listen_port = 51820
 virtual_ip = "10.0.0.1/24"
-tun_name = "meshlink0"
+tun_name = "OpenFrenzy0"
 
 [coordination]
 server = "coord.example.com:4000"
