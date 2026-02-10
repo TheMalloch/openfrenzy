@@ -21,11 +21,30 @@ impl Credentials {
     /// Save credentials to a specific path.
     pub fn save_to(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating directory {:?}", parent))?;
+            std::fs::create_dir_all(parent).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    anyhow::anyhow!(
+                        "Permission denied creating {:?}\n\n\
+                         Hint: Run 'sudo meshlink setup' first to configure directory permissions.",
+                        parent
+                    )
+                } else {
+                    anyhow::Error::new(e).context(format!("creating directory {:?}", parent))
+                }
+            })?;
         }
         let json = serde_json::to_string_pretty(self).context("serializing credentials")?;
-        std::fs::write(path, json).with_context(|| format!("writing credentials to {:?}", path))?;
+        std::fs::write(path, &json).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                anyhow::anyhow!(
+                    "Permission denied writing {:?}\n\n\
+                     Hint: Run 'sudo meshlink setup' first to configure directory permissions.",
+                    path
+                )
+            } else {
+                anyhow::Error::new(e).context(format!("writing credentials to {:?}", path))
+            }
+        })?;
         Ok(())
     }
 

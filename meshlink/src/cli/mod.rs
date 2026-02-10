@@ -62,6 +62,8 @@ pub enum Command {
         #[arg(long)]
         server: Option<String>,
     },
+    /// Initialize system directories, group, and permissions for meshlink.
+    Setup,
 }
 
 /// Parameters for server-orchestrated mode, resolved from CLI args, credentials, or env vars.

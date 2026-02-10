@@ -6,5 +6,6 @@ pub mod crypto;
 pub mod discovery;
 pub mod net;
 pub mod router;
+pub mod setup;
 pub mod state;
 pub mod tun;

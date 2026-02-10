@@ -6,6 +6,7 @@ mod crypto;
 mod discovery;
 mod net;
 mod router;
+mod setup;
 mod state;
 mod tun;
 
@@ -56,6 +57,10 @@ async fn main() -> Result<()> {
         Some(Command::Unregister { server }) => {
             return handle_unregister(server.as_deref()).await;
         }
+        Some(Command::Setup) => {
+            setup::run_setup()?;
+            return Ok(());
+        }
         Some(Command::Up {
             server,
             node_id,
@@ -91,9 +96,11 @@ async fn handle_register(server: &str, invite_code: &str, name: Option<&str>) ->
     // Write the config file
     let config_path = std::path::Path::new("/etc/meshlink/config.toml");
     if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent).context("creating /etc/meshlink")?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| wrap_permission_error(e, "creating /etc/meshlink"))?;
     }
-    std::fs::write(config_path, &resp.config_toml).context("writing config file")?;
+    std::fs::write(config_path, &resp.config_toml)
+        .map_err(|e| wrap_permission_error(e, "writing config file"))?;
 
     println!("Registration successful!");
     println!("  Node ID:    {}", resp.node_id);
@@ -140,9 +147,11 @@ async fn run_daemon(
 
         // Write to disk for reference
         if let Some(parent) = config_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent)
+                .map_err(|e| wrap_permission_error(e, "creating config directory"))?;
         }
-        let _ = std::fs::write(config_path, &config_toml);
+        std::fs::write(config_path, &config_toml)
+            .map_err(|e| wrap_permission_error(e, "writing config file"))?;
 
         config::Config::from_toml_string(&config_toml)?
     } else {
@@ -301,4 +310,17 @@ async fn run_daemon(
 
     info!("MeshLink stopped");
     Ok(())
+}
+
+/// If an IO error is a permission error, wrap it with a suggestion to run `meshlink setup`.
+fn wrap_permission_error(err: std::io::Error, context: &str) -> anyhow::Error {
+    if err.kind() == std::io::ErrorKind::PermissionDenied {
+        anyhow::anyhow!(
+            "{context}: permission denied\n\n\
+             Hint: Run 'sudo meshlink setup' first to configure directory permissions,\n\
+             then retry this command."
+        )
+    } else {
+        anyhow::Error::new(err).context(context.to_string())
+    }
 }
