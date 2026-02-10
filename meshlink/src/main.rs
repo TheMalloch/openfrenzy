@@ -216,8 +216,9 @@ async fn run_daemon(
     let tun_dev = tun::create_tun_device(&config.node.tun_name, config.node.virtual_ip)?;
     let (tun_read, tun_write) = tokio::io::split(tun_dev);
 
-    // Bind UDP socket
-    let udp_socket = Arc::new(net::udp::bind_udp(config.node.listen_port).await?);
+    // Bind UDP socket (tries configured port, then up to +10 if in use)
+    let (udp_raw, actual_port) = net::udp::bind_udp(config.node.listen_port).await?;
+    let udp_socket = Arc::new(udp_raw);
 
     // Create pipeline channels
     let channels = state::PipelineChannels::new(256);
@@ -265,7 +266,7 @@ async fn run_daemon(
         identity.clone(),
         udp_socket.clone(),
         coord_addr,
-        config.node.listen_port,
+        actual_port,
         channels.router_to_udp_tx,
     ));
 

@@ -1,19 +1,34 @@
 use crate::state::RoutedPacket;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
-/// Bind a UDP socket on the given port.
-pub async fn bind_udp(listen_port: u16) -> Result<UdpSocket> {
-    let addr: SocketAddr = format!("0.0.0.0:{listen_port}").parse().unwrap();
-    let socket = UdpSocket::bind(addr)
-        .await
-        .with_context(|| format!("binding UDP socket on port {listen_port}"))?;
-    info!(%addr, "UDP socket bound");
-    Ok(socket)
+/// Bind a UDP socket, trying ports from `listen_port` up to `listen_port + 10`.
+/// Returns the socket and the port it actually bound to.
+pub async fn bind_udp(listen_port: u16) -> Result<(UdpSocket, u16)> {
+    for port in listen_port..=listen_port.saturating_add(10) {
+        let addr: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
+        match UdpSocket::bind(addr).await {
+            Ok(socket) => {
+                if port != listen_port {
+                    info!(%addr, configured_port = listen_port, "UDP socket bound (configured port was in use)");
+                } else {
+                    info!(%addr, "UDP socket bound");
+                }
+                return Ok((socket, port));
+            }
+            Err(e) => {
+                debug!(port, error = %e, "port unavailable, trying next");
+            }
+        }
+    }
+    anyhow::bail!(
+        "could not bind UDP socket on ports {listen_port}–{}",
+        listen_port.saturating_add(10)
+    )
 }
 
 /// Task: read datagrams from UDP socket, forward to inbound pipeline with source address.
