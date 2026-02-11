@@ -229,8 +229,12 @@ pub async fn server_heartbeat_task(
                                             Err(_) => continue,
                                         };
 
-                                        // Only add if not already known
-                                        if state.get_peer(&pub_key_bytes).await.is_none() {
+                                        if state.get_peer(&pub_key_bytes).await.is_some() {
+                                            // Peer already known — update endpoint if the config has one
+                                            if let Some(ep) = peer_config.endpoint {
+                                                state.set_peer_endpoint(&pub_key_bytes, ep).await;
+                                            }
+                                        } else {
                                             let virtual_ip = peer_config
                                                 .allowed_ips
                                                 .first()

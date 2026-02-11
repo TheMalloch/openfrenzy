@@ -86,7 +86,7 @@ async fn main() -> Result<()> {
     info!(%http_addr, "HTTP API server starting");
 
     let http_server = tokio::spawn(async move {
-        if let Err(e) = axum::serve(http_listener, app).await {
+        if let Err(e) = axum::serve(http_listener, app.into_make_service_with_connect_info::<SocketAddr>()).await {
             warn!(error = %e, "HTTP server error");
         }
     });
@@ -128,7 +128,7 @@ async fn main() -> Result<()> {
                         if n == 0 {
                             continue;
                         }
-                        handle_message(&socket, &mut peers, &buf[..n], src).await;
+                        handle_message(&socket, &mut peers, &database, &buf[..n], src).await;
                     }
                     Err(e) => {
                         warn!(error = %e, "recv error");
@@ -159,6 +159,7 @@ async fn main() -> Result<()> {
 async fn handle_message(
     socket: &UdpSocket,
     peers: &mut HashMap<[u8; 32], RegisteredPeer>,
+    database: &db::Db,
     data: &[u8],
     src: SocketAddr,
 ) {
@@ -167,13 +168,13 @@ async fn handle_message(
             handle_nat_detect(socket, src).await;
         }
         proto::REGISTER => {
-            handle_register(peers, data, src);
+            handle_register(peers, database, data, src).await;
         }
         proto::PEER_LIST_REQ => {
             handle_peer_list_req(socket, peers, data, src).await;
         }
         proto::KEEPALIVE => {
-            handle_keepalive(peers, data, src);
+            handle_keepalive(peers, database, data, src).await;
         }
         t => {
             debug!(msg_type = t, %src, "unknown message type");
@@ -199,7 +200,7 @@ async fn handle_nat_detect(socket: &UdpSocket, src: SocketAddr) {
     }
 }
 
-fn handle_register(peers: &mut HashMap<[u8; 32], RegisteredPeer>, data: &[u8], src: SocketAddr) {
+async fn handle_register(peers: &mut HashMap<[u8; 32], RegisteredPeer>, database: &db::Db, data: &[u8], src: SocketAddr) {
     if data.len() < 35 {
         debug!(%src, "register message too short");
         return;
@@ -220,6 +221,21 @@ fn handle_register(peers: &mut HashMap<[u8; 32], RegisteredPeer>, data: &[u8], s
             last_seen: Instant::now(),
         },
     );
+
+    // Persist endpoint to the database so HTTP config endpoints return it.
+    // Use src directly — it's the NAT-visible IP:port.
+    let endpoint_str = src.to_string();
+    match database.update_endpoint_by_pubkey(&public_key, &endpoint_str).await {
+        Ok(true) => {
+            debug!(%src, %endpoint_str, "persisted endpoint to database");
+        }
+        Ok(false) => {
+            debug!(%src, "UDP register: no matching node in database for this public key");
+        }
+        Err(e) => {
+            warn!(error = %e, %src, "failed to persist endpoint to database");
+        }
+    }
 
     if is_new {
         info!(%src, listen_port, "new peer registered");
@@ -271,7 +287,7 @@ async fn handle_peer_list_req(
     }
 }
 
-fn handle_keepalive(peers: &mut HashMap<[u8; 32], RegisteredPeer>, data: &[u8], src: SocketAddr) {
+async fn handle_keepalive(peers: &mut HashMap<[u8; 32], RegisteredPeer>, database: &db::Db, data: &[u8], src: SocketAddr) {
     if data.len() < 33 {
         return;
     }
@@ -284,6 +300,22 @@ fn handle_keepalive(peers: &mut HashMap<[u8; 32], RegisteredPeer>, data: &[u8], 
         peer.endpoint = src;
         debug!(%src, "keepalive received");
     } else {
-        debug!(%src, "keepalive from unknown peer");
+        // After server restart, in-memory map is empty. Re-register the peer.
+        peers.insert(
+            public_key,
+            RegisteredPeer {
+                public_key,
+                endpoint: src,
+                listen_port: src.port(),
+                last_seen: Instant::now(),
+            },
+        );
+        info!(%src, "re-registered peer from keepalive");
+    }
+
+    // Persist endpoint to database
+    let endpoint_str = src.to_string();
+    if let Err(e) = database.update_endpoint_by_pubkey(&public_key, &endpoint_str).await {
+        warn!(error = %e, %src, "failed to persist keepalive endpoint to database");
     }
 }

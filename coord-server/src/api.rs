@@ -2,11 +2,12 @@ use crate::config_generator;
 use crate::db::{Db, NodeRecord};
 use crate::ip_allocator::IpAllocator;
 use crate::key_manager;
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use std::net::SocketAddr;
 use base64::Engine;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -234,10 +235,11 @@ async fn get_config(
 }
 
 /// POST /api/v1/node/:id/heartbeat
-/// Update the node's last_seen timestamp.
+/// Update the node's last_seen timestamp and endpoint.
 async fn heartbeat(
     State(state): State<AppState>,
     Path(node_id): Path<String>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let node = match validate_auth(&state.db, &node_id, &headers).await {
@@ -247,7 +249,24 @@ async fn heartbeat(
 
     let last_update = node.updated_at;
 
-    if let Err(e) = state.db.update_heartbeat(&node_id, None).await {
+    // Extract the real client IP from proxy headers, falling back to ConnectInfo.
+    let client_ip = headers
+        .get("cf-connecting-ip")
+        .or_else(|| headers.get("x-forwarded-for"))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| addr.ip().to_string());
+
+    // Build the endpoint from the client's real IP and the node's configured listen port.
+    let endpoint_str = if client_ip.contains(':') {
+        // IPv6: use bracket notation
+        format!("[{}]:{}", client_ip, node.listen_port)
+    } else {
+        format!("{}:{}", client_ip, node.listen_port)
+    };
+
+    if let Err(e) = state.db.update_heartbeat(&node_id, Some(&endpoint_str)).await {
         warn!(error = %e, "failed to update heartbeat");
         return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
     }

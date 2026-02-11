@@ -166,6 +166,25 @@ impl Db {
         Ok(result.rows_affected())
     }
 
+    /// Update a node's endpoint and heartbeat by its public key (used by UDP registration).
+    pub async fn update_endpoint_by_pubkey(
+        &self,
+        public_key: &[u8],
+        endpoint: &str,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            r#"UPDATE nodes SET endpoint = $1, last_heartbeat = NOW(), updated_at = NOW(),
+               status = 'active'
+               WHERE public_key = $2 AND status IN ('registered', 'active')"#,
+        )
+        .bind(endpoint)
+        .bind(public_key)
+        .execute(&self.pool)
+        .await
+        .context("updating endpoint by public key")?;
+        Ok(result.rows_affected() > 0)
+    }
+
     // --- Invite operations ---
 
     /// Create a new invite code.
