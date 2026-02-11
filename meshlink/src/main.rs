@@ -65,13 +65,14 @@ async fn main() -> Result<()> {
             server,
             node_id,
             auth_token,
+            coord_server,
         }) => {
             let server_params = cli::ServerParams::resolve(server, node_id, auth_token);
-            run_daemon(&cli.config, server_params).await?;
+            run_daemon(&cli.config, server_params, coord_server).await?;
         }
         None => {
             // Default: start the daemon with no server params
-            run_daemon(&cli.config, None).await?;
+            run_daemon(&cli.config, None, None).await?;
         }
     }
 
@@ -135,11 +136,12 @@ async fn handle_unregister(server: Option<&str>) -> Result<()> {
 async fn run_daemon(
     config_path: &std::path::Path,
     server_params: Option<cli::ServerParams>,
+    coord_server_override: Option<String>,
 ) -> Result<()> {
     info!("MeshLink starting");
 
     // If server mode, fetch config from API first
-    let config = if let Some(ref params) = server_params {
+    let mut config = if let Some(ref params) = server_params {
         info!(server = %params.server, node_id = %params.node_id, "fetching config from server");
         let client =
             api_client::ApiClient::new(&params.server, Some(params.auth_token.clone()));
@@ -157,6 +159,12 @@ async fn run_daemon(
     } else {
         config::Config::load(config_path)?
     };
+
+    // Override coordination server if provided via CLI
+    if let Some(addr) = coord_server_override {
+        info!(coord_server = %addr, "overriding coordination server from CLI");
+        config.coordination.server = addr;
+    }
 
     info!(
         virtual_ip = %config.node.virtual_ip,

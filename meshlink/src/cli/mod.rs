@@ -33,6 +33,11 @@ pub enum Command {
         /// Authentication token (from registration).
         #[arg(long)]
         auth_token: Option<String>,
+
+        /// Coordination server address for UDP peer discovery (e.g., r.rasporar.org:4000).
+        /// Overrides the [coordination] server value in config.
+        #[arg(long)]
+        coord_server: Option<String>,
     },
     /// Stop the meshlink daemon.
     Down,

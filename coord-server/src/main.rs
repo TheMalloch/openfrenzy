@@ -66,8 +66,10 @@ async fn main() -> Result<()> {
     let ip_allocator = ip_allocator::IpAllocator::new(&mesh_network)
         .context("initializing IP allocator")?;
 
-    // Coordination server address that nodes should use in their config
-    let coord_server_addr = format!("0.0.0.0:{udp_port}");
+    // Public address that nodes use to reach the coordination server.
+    // Must be set to the server's reachable hostname/IP (e.g. "r.rasporar.org:4000").
+    let coord_server_addr = std::env::var("COORD_SERVER_ADDR")
+        .unwrap_or_else(|_| format!("0.0.0.0:{udp_port}"));
 
     // Build API state and router
     let app_state = api::AppState {
