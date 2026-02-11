@@ -2,6 +2,7 @@ mod api;
 mod config_generator;
 mod db;
 mod ip_allocator;
+mod jwt;
 mod key_manager;
 
 use anyhow::{Context, Result};
@@ -77,17 +78,24 @@ async fn main() -> Result<()> {
         info!("admin API enabled (ADMIN_TOKEN set)");
     }
 
+    // Initialize JWT signing key
+    let jwt_state = jwt::init_signing_key(&database.pool)
+        .await
+        .context("initializing JWT signing key")?;
+    info!(key_id = %jwt_state.key_id, "JWT signing key ready");
+
     // Build API state and router
     let app_state = api::AppState {
         db: database.clone(),
         ip_allocator,
         coord_server_addr,
         admin_token,
+        jwt: jwt_state,
     };
 
     let app = api::router(app_state);
 
-    // Start HTTP server
+    // Start HTTP API server
     let http_addr: SocketAddr = format!("[::]:{http_port}").parse()?;
     let http_listener = tokio::net::TcpListener::bind(http_addr).await?;
     info!(%http_addr, "HTTP API server starting");
@@ -95,6 +103,110 @@ async fn main() -> Result<()> {
     let http_server = tokio::spawn(async move {
         if let Err(e) = axum::serve(http_listener, app.into_make_service_with_connect_info::<SocketAddr>()).await {
             warn!(error = %e, "HTTP server error");
+        }
+    });
+
+    // Start landing page server on port 4002
+    let landing_port: u16 = std::env::var("LANDING_PORT")
+        .unwrap_or_else(|_| "4002".into())
+        .parse()
+        .context("parsing LANDING_PORT")?;
+    let landing_addr: SocketAddr = format!("[::]:{landing_port}").parse()?;
+    let landing_listener = tokio::net::TcpListener::bind(landing_addr).await?;
+    info!(%landing_addr, "landing page server starting");
+
+    let landing_app = axum::Router::new().route(
+        "/",
+        axum::routing::get(|| async {
+            axum::response::Html(
+r#"<!-- https://apiopenfrenzy.rasporar.org -->
+<html>
+<head>
+<title>OpenFrenzy API</title>
+<style>
+*{margin:0;padding:0}
+body{background:#000;color:#00ff41;font-family:'Courier New',monospace;font-size:14px;padding:40px;overflow-x:hidden}
+pre{line-height:1.6}
+.dim{color:#005f15}
+.bright{color:#00ff41;text-shadow:0 0 5px #00ff41}
+.header{color:#00ff41;text-shadow:0 0 10px #00ff41,0 0 20px #003b00}
+.method{color:#39ff14}
+.path{color:#00cc33}
+.desc{color:#008f11}
+.section{color:#00ff41;text-shadow:0 0 8px #00ff41;border-bottom:1px solid #003b00;padding-bottom:4px;margin-bottom:8px;display:inline-block}
+canvas{position:fixed;top:0;left:0;z-index:-1;opacity:0.15}
+</style>
+</head>
+<body>
+<canvas id="m"></canvas>
+<pre>
+<span class="header">  ___                 _____
+ / _ \ _ __  ___ _ _ |  ___| __ ___ _ __  _____   _
+| | | | '_ \/ _ \ ' \| |_ | '__/ _ \ '_ \|_  / | | |
+| |_| | |_) |  __/ | ||  _|| | |  __/ | | |/ /| |_| |
+ \___/| .__/ \___|_||_|_|  |_|  \___|_| |_/___|\__, |
+      |_|                                       |___/  </span>
+
+<span class="dim">Coordination server for the MeshLink peer-to-peer network.</span>
+
+<span class="section">=== Node API ===</span>
+<span class="method">POST  </span> <span class="path">/api/v1/register</span>                              <span class="desc">Register node (invite_code, node_name)</span>
+<span class="method">GET   </span> <span class="path">/api/v1/node/{id}/config</span>                      <span class="desc">Get node config [Bearer node_token]</span>
+<span class="method">POST  </span> <span class="path">/api/v1/node/{id}/heartbeat</span>                   <span class="desc">Send heartbeat [Bearer node_token]</span>
+<span class="method">DELETE</span> <span class="path">/api/v1/node/{id}</span>                              <span class="desc">Deregister node [Bearer node_token]</span>
+
+<span class="section">=== Service / ACL ===</span>
+<span class="method">POST  </span> <span class="path">/api/v1/node/{id}/services</span>                    <span class="desc">Declare service (name, port, protocol) [Bearer node_token]</span>
+<span class="method">GET   </span> <span class="path">/api/v1/node/{id}/services</span>                     <span class="desc">List node services [Bearer node_token]</span>
+<span class="method">DELETE</span> <span class="path">/api/v1/node/{id}/services/{svc_id}</span>            <span class="desc">Delete service [Bearer node_token]</span>
+<span class="method">POST  </span> <span class="path">/api/v1/node/{id}/services/{svc_id}/rules</span>      <span class="desc">Create access rule [Bearer node_token]</span>
+<span class="method">GET   </span> <span class="path">/api/v1/node/{id}/services/{svc_id}/rules</span>       <span class="desc">List rules [Bearer node_token]</span>
+<span class="method">DELETE</span> <span class="path">/api/v1/node/{id}/services/{svc_id}/rules/{rid}</span> <span class="desc">Delete rule [Bearer node_token]</span>
+
+<span class="section">=== Admin ===</span>
+<span class="method">POST  </span> <span class="path">/api/v1/admin/invite</span>                           <span class="desc">Create node invite [Bearer admin_token]</span>
+<span class="method">POST  </span> <span class="path">/api/v1/admin/services/{svc_id}/rules</span>          <span class="desc">Create admin rule [Bearer admin_token]</span>
+<span class="method">DELETE</span> <span class="path">/api/v1/admin/services/{svc_id}/rules/{rid}</span>     <span class="desc">Delete admin rule [Bearer admin_token]</span>
+<span class="method">POST  </span> <span class="path">/api/v1/admin/user-invite</span>                       <span class="desc">Create user invite [Bearer admin_token]</span>
+<span class="method">POST  </span> <span class="path">/api/v1/admin/users/{user_id}/approve</span>           <span class="desc">Approve user [Bearer admin_token]</span>
+<span class="method">GET   </span> <span class="path">/api/v1/admin/users?status=</span>                     <span class="desc">List users [Bearer admin_token]</span>
+
+<span class="section">=== Auth ===</span>
+<span class="method">POST  </span> <span class="path">/api/v1/auth/register</span>                          <span class="desc">Register user (invite_code, username, password)</span>
+<span class="method">POST  </span> <span class="path">/api/v1/auth/login</span>                              <span class="desc">Login (username, password) -> tokens</span>
+<span class="method">POST  </span> <span class="path">/api/v1/auth/refresh</span>                            <span class="desc">Refresh access token (refresh_token)</span>
+<span class="method">GET   </span> <span class="path">/api/v1/auth/userinfo</span>                           <span class="desc">Get current user [Bearer JWT]</span>
+
+<span class="section">=== Discovery ===</span>
+<span class="method">GET   </span> <span class="path">/api/v1/.well-known/jwks.json</span>                   <span class="desc">Public signing key (JWK)</span>
+</pre>
+<script>
+var c=document.getElementById('m'),x=c.getContext('2d');
+c.width=window.innerWidth;c.height=window.innerHeight;
+var cols=Math.floor(c.width/14),drops=[];
+for(var i=0;i<cols;i++)drops[i]=Math.random()*-100;
+var chars='01';
+function draw(){
+x.fillStyle='rgba(0,0,0,0.05)';x.fillRect(0,0,c.width,c.height);
+x.fillStyle='#00ff41';x.font='14px monospace';
+for(var i=0;i<drops.length;i++){
+var t=chars[Math.floor(Math.random()*chars.length)];
+x.fillText(t,i*14,drops[i]*14);
+if(drops[i]*14>c.height&&Math.random()>0.975)drops[i]=0;
+drops[i]++;
+}}
+setInterval(draw,50);
+</script>
+</body>
+</html>
+"#,
+            )
+        }),
+    );
+
+    let _landing_server = tokio::spawn(async move {
+        if let Err(e) = axum::serve(landing_listener, landing_app).await {
+            warn!(error = %e, "landing page server error");
         }
     });
 

@@ -20,3 +20,7 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 ipnet = "2"
 toml = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
+jsonwebtoken = "9"
+argon2 = "0.5"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+sha2 = "0.10"

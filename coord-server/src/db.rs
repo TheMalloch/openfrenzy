@@ -63,6 +63,39 @@ pub struct InviteRecord {
     pub used_by_node_id: Option<String>,
 }
 
+/// A user record from the database.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct UserRecord {
+    pub user_id: String,
+    pub username: String,
+    pub password_hash: String,
+    pub display_name: Option<String>,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// A user invite record from the database.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct UserInviteRecord {
+    pub code: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub used_at: Option<DateTime<Utc>>,
+    pub used_by_user_id: Option<String>,
+}
+
+/// A refresh token record from the database.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct RefreshTokenRecord {
+    pub token_id: String,
+    pub user_id: String,
+    pub token_hash: String,
+    pub expires_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
 /// Database handle wrapping a PostgreSQL connection pool.
 #[derive(Clone)]
 pub struct Db {
@@ -408,6 +441,159 @@ impl Db {
         .await
         .context("listing allocated IPs")?;
         Ok(rows.into_iter().map(|(ip,)| ip).collect())
+    }
+
+    // --- User invite operations ---
+
+    pub async fn create_user_invite(&self, code: &str, expires_at: DateTime<Utc>) -> Result<()> {
+        sqlx::query("INSERT INTO user_invites (code, expires_at) VALUES ($1, $2)")
+            .bind(code)
+            .bind(expires_at)
+            .execute(&self.pool)
+            .await
+            .context("creating user invite")?;
+        Ok(())
+    }
+
+    pub async fn get_user_invite(&self, code: &str) -> Result<Option<UserInviteRecord>> {
+        let invite =
+            sqlx::query_as::<_, UserInviteRecord>("SELECT * FROM user_invites WHERE code = $1")
+                .bind(code)
+                .fetch_optional(&self.pool)
+                .await
+                .context("fetching user invite")?;
+        Ok(invite)
+    }
+
+    pub async fn use_user_invite(&self, code: &str, user_id: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE user_invites SET used_at = NOW(), used_by_user_id = $1 WHERE code = $2",
+        )
+        .bind(user_id)
+        .bind(code)
+        .execute(&self.pool)
+        .await
+        .context("using user invite")?;
+        Ok(())
+    }
+
+    // --- User operations ---
+
+    pub async fn insert_user(&self, user: &UserRecord) -> Result<()> {
+        sqlx::query(
+            r#"INSERT INTO users (user_id, username, password_hash, display_name, status, created_at, updated_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
+        )
+        .bind(&user.user_id)
+        .bind(&user.username)
+        .bind(&user.password_hash)
+        .bind(&user.display_name)
+        .bind(&user.status)
+        .bind(user.created_at)
+        .bind(user.updated_at)
+        .execute(&self.pool)
+        .await
+        .context("inserting user")?;
+        Ok(())
+    }
+
+    pub async fn get_user(&self, user_id: &str) -> Result<Option<UserRecord>> {
+        let user = sqlx::query_as::<_, UserRecord>("SELECT * FROM users WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await
+            .context("fetching user")?;
+        Ok(user)
+    }
+
+    pub async fn get_user_by_username(&self, username: &str) -> Result<Option<UserRecord>> {
+        let user = sqlx::query_as::<_, UserRecord>("SELECT * FROM users WHERE username = $1")
+            .bind(username)
+            .fetch_optional(&self.pool)
+            .await
+            .context("fetching user by username")?;
+        Ok(user)
+    }
+
+    pub async fn update_user_status(&self, user_id: &str, status: &str) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE users SET status = $1, updated_at = NOW() WHERE user_id = $2",
+        )
+        .bind(status)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await
+        .context("updating user status")?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn list_users(&self, status_filter: Option<&str>) -> Result<Vec<UserRecord>> {
+        let users = if let Some(status) = status_filter {
+            sqlx::query_as::<_, UserRecord>(
+                "SELECT * FROM users WHERE status = $1 ORDER BY created_at",
+            )
+            .bind(status)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query_as::<_, UserRecord>("SELECT * FROM users ORDER BY created_at")
+                .fetch_all(&self.pool)
+                .await
+        }
+        .context("listing users")?;
+        Ok(users)
+    }
+
+    // --- Refresh token operations ---
+
+    pub async fn insert_refresh_token(&self, token: &RefreshTokenRecord) -> Result<()> {
+        sqlx::query(
+            r#"INSERT INTO refresh_tokens (token_id, user_id, token_hash, expires_at, created_at)
+               VALUES ($1, $2, $3, $4, $5)"#,
+        )
+        .bind(&token.token_id)
+        .bind(&token.user_id)
+        .bind(&token.token_hash)
+        .bind(token.expires_at)
+        .bind(token.created_at)
+        .execute(&self.pool)
+        .await
+        .context("inserting refresh token")?;
+        Ok(())
+    }
+
+    pub async fn get_refresh_token_by_hash(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<RefreshTokenRecord>> {
+        let token = sqlx::query_as::<_, RefreshTokenRecord>(
+            "SELECT * FROM refresh_tokens WHERE token_hash = $1 AND revoked_at IS NULL",
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .context("fetching refresh token")?;
+        Ok(token)
+    }
+
+    pub async fn revoke_refresh_token(&self, token_id: &str) -> Result<()> {
+        sqlx::query("UPDATE refresh_tokens SET revoked_at = NOW() WHERE token_id = $1")
+            .bind(token_id)
+            .execute(&self.pool)
+            .await
+            .context("revoking refresh token")?;
+        Ok(())
+    }
+
+    pub async fn revoke_all_user_refresh_tokens(&self, user_id: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(user_id)
+        .execute(&self.pool)
+        .await
+        .context("revoking all user refresh tokens")?;
+        Ok(())
     }
 }
 

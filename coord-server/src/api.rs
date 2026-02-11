@@ -1,16 +1,19 @@
 use crate::config_generator;
-use crate::db::{AccessRuleRecord, Db, NodeRecord, ServiceRecord};
+use crate::db::{AccessRuleRecord, Db, NodeRecord, RefreshTokenRecord, ServiceRecord, UserRecord};
 use crate::ip_allocator::IpAllocator;
+use crate::jwt::{self, JwtState};
 use crate::key_manager;
-use axum::extract::{ConnectInfo, Path, State};
+use argon2::password_hash::SaltString;
+use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use std::net::SocketAddr;
 use base64::Engine;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -21,6 +24,7 @@ pub struct AppState {
     pub ip_allocator: IpAllocator,
     pub coord_server_addr: String,
     pub admin_token: Option<String>,
+    pub jwt: JwtState,
 }
 
 /// Build the Axum router with all API routes.
@@ -41,6 +45,17 @@ pub fn router(state: AppState) -> Router {
         // Admin override endpoints
         .route("/api/v1/admin/services/{svc_id}/rules", post(admin_create_rule))
         .route("/api/v1/admin/services/{svc_id}/rules/{rule_id}", delete(admin_delete_rule))
+        // User management (admin)
+        .route("/api/v1/admin/user-invite", post(create_user_invite))
+        .route("/api/v1/admin/users/{user_id}/approve", post(approve_user))
+        .route("/api/v1/admin/users", get(list_users))
+        // Auth endpoints
+        .route("/api/v1/auth/register", post(register_user))
+        .route("/api/v1/auth/login", post(login))
+        .route("/api/v1/auth/refresh", post(refresh))
+        .route("/api/v1/auth/userinfo", get(userinfo))
+        // JWKS
+        .route("/api/v1/.well-known/jwks.json", get(jwks))
         .with_state(state)
 }
 
@@ -694,4 +709,501 @@ async fn admin_delete_rule(
 
     info!(rule_id = %rule_id, "admin rule deleted");
     StatusCode::NO_CONTENT.into_response()
+}
+
+// --- User auth request/response types ---
+
+#[derive(Deserialize)]
+struct RegisterUserRequest {
+    invite_code: String,
+    username: String,
+    password: String,
+    display_name: Option<String>,
+}
+
+#[derive(Serialize)]
+struct RegisterUserResponse {
+    user_id: String,
+    username: String,
+    status: String,
+}
+
+#[derive(Deserialize)]
+struct LoginRequest {
+    username: String,
+    password: String,
+}
+
+#[derive(Serialize)]
+struct LoginResponse {
+    access_token: String,
+    refresh_token: String,
+    token_type: String,
+    expires_in: u64,
+}
+
+#[derive(Deserialize)]
+struct RefreshRequest {
+    refresh_token: String,
+}
+
+#[derive(Serialize)]
+struct RefreshResponse {
+    access_token: String,
+    token_type: String,
+    expires_in: u64,
+}
+
+#[derive(Serialize)]
+struct UserInfoResponse {
+    user_id: String,
+    username: String,
+    display_name: Option<String>,
+    status: String,
+}
+
+#[derive(Serialize)]
+struct UserInviteResponse {
+    code: String,
+    expires_at: String,
+}
+
+#[derive(Deserialize)]
+struct ListUsersQuery {
+    status: Option<String>,
+}
+
+#[derive(Serialize)]
+struct UserListEntry {
+    user_id: String,
+    username: String,
+    display_name: Option<String>,
+    status: String,
+    created_at: String,
+}
+
+// --- User/Auth handlers ---
+
+/// POST /api/v1/admin/user-invite
+async fn create_user_invite(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(resp) = validate_admin_token(&state.admin_token, &headers) {
+        return resp.into_response();
+    }
+
+    let code = Uuid::new_v4().to_string();
+    let expires_at = Utc::now() + chrono::Duration::hours(24);
+
+    if let Err(e) = state.db.create_user_invite(&code, expires_at).await {
+        warn!(error = %e, "failed to create user invite");
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+    }
+
+    info!(code = %code, "user invite created");
+    (
+        StatusCode::CREATED,
+        Json(UserInviteResponse {
+            code,
+            expires_at: expires_at.to_rfc3339(),
+        }),
+    )
+        .into_response()
+}
+
+/// POST /api/v1/auth/register
+async fn register_user(
+    State(state): State<AppState>,
+    Json(req): Json<RegisterUserRequest>,
+) -> impl IntoResponse {
+    // Validate invite
+    let invite = match state.db.get_user_invite(&req.invite_code).await {
+        Ok(Some(inv)) => inv,
+        Ok(None) => {
+            return error_response(StatusCode::BAD_REQUEST, "invalid invite code").into_response()
+        }
+        Err(e) => {
+            warn!(error = %e, "database error checking user invite");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+                .into_response();
+        }
+    };
+
+    if invite.used_at.is_some() {
+        return error_response(StatusCode::BAD_REQUEST, "invite code already used").into_response();
+    }
+    if invite.expires_at < Utc::now() {
+        return error_response(StatusCode::BAD_REQUEST, "invite code expired").into_response();
+    }
+
+    // Validate username
+    if req.username.len() < 3 || req.username.len() > 64 {
+        return error_response(StatusCode::BAD_REQUEST, "username must be 3-64 characters")
+            .into_response();
+    }
+    if !req
+        .username
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+    {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "username may only contain alphanumeric, underscore, or hyphen",
+        )
+        .into_response();
+    }
+
+    // Validate password
+    if req.password.len() < 8 {
+        return error_response(StatusCode::BAD_REQUEST, "password must be at least 8 characters")
+            .into_response();
+    }
+
+    // Check username uniqueness
+    match state.db.get_user_by_username(&req.username).await {
+        Ok(Some(_)) => {
+            return error_response(StatusCode::CONFLICT, "username already taken").into_response()
+        }
+        Err(e) => {
+            warn!(error = %e, "database error checking username");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+                .into_response();
+        }
+        Ok(None) => {}
+    }
+
+    // Hash password
+    let salt = SaltString::generate(&mut rand::rngs::OsRng);
+    let password_hash = match Argon2::default().hash_password(req.password.as_bytes(), &salt) {
+        Ok(h) => h.to_string(),
+        Err(e) => {
+            warn!(error = %e, "failed to hash password");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+                .into_response();
+        }
+    };
+
+    let now = Utc::now();
+    let user_id = Uuid::new_v4().to_string();
+
+    let user = UserRecord {
+        user_id: user_id.clone(),
+        username: req.username.clone(),
+        password_hash,
+        display_name: req.display_name,
+        status: "pending".into(),
+        created_at: now,
+        updated_at: now,
+    };
+
+    if let Err(e) = state.db.insert_user(&user).await {
+        warn!(error = %e, "failed to insert user");
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+    }
+
+    // Mark invite as used
+    if let Err(e) = state.db.use_user_invite(&req.invite_code, &user_id).await {
+        warn!(error = %e, "failed to mark user invite as used");
+    }
+
+    info!(user_id = %user_id, username = %req.username, "user registered (pending approval)");
+    (
+        StatusCode::CREATED,
+        Json(RegisterUserResponse {
+            user_id,
+            username: req.username,
+            status: "pending".into(),
+        }),
+    )
+        .into_response()
+}
+
+/// POST /api/v1/admin/users/{user_id}/approve
+async fn approve_user(
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(resp) = validate_admin_token(&state.admin_token, &headers) {
+        return resp.into_response();
+    }
+
+    let user = match state.db.get_user(&user_id).await {
+        Ok(Some(u)) => u,
+        Ok(None) => {
+            return error_response(StatusCode::NOT_FOUND, "user not found").into_response()
+        }
+        Err(e) => {
+            warn!(error = %e, "database error");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+                .into_response();
+        }
+    };
+
+    if user.status != "pending" {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!("user status is '{}', expected 'pending'", user.status),
+        )
+        .into_response();
+    }
+
+    if let Err(e) = state.db.update_user_status(&user_id, "active").await {
+        warn!(error = %e, "failed to approve user");
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+    }
+
+    info!(user_id = %user_id, "user approved");
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// GET /api/v1/admin/users
+async fn list_users(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ListUsersQuery>,
+) -> impl IntoResponse {
+    if let Err(resp) = validate_admin_token(&state.admin_token, &headers) {
+        return resp.into_response();
+    }
+
+    match state
+        .db
+        .list_users(query.status.as_deref())
+        .await
+    {
+        Ok(users) => {
+            let entries: Vec<UserListEntry> = users
+                .into_iter()
+                .map(|u| UserListEntry {
+                    user_id: u.user_id,
+                    username: u.username,
+                    display_name: u.display_name,
+                    status: u.status,
+                    created_at: u.created_at.to_rfc3339(),
+                })
+                .collect();
+            Json(entries).into_response()
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to list users");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
+    }
+}
+
+/// POST /api/v1/auth/login
+async fn login(
+    State(state): State<AppState>,
+    Json(req): Json<LoginRequest>,
+) -> impl IntoResponse {
+    let user = match state.db.get_user_by_username(&req.username).await {
+        Ok(Some(u)) => u,
+        Ok(None) => {
+            return error_response(StatusCode::UNAUTHORIZED, "invalid credentials").into_response()
+        }
+        Err(e) => {
+            warn!(error = %e, "database error during login");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+                .into_response();
+        }
+    };
+
+    // Verify password
+    let parsed_hash = match PasswordHash::new(&user.password_hash) {
+        Ok(h) => h,
+        Err(_) => {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+                .into_response()
+        }
+    };
+
+    if Argon2::default()
+        .verify_password(req.password.as_bytes(), &parsed_hash)
+        .is_err()
+    {
+        return error_response(StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+    }
+
+    // Check user status
+    if user.status != "active" {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            format!("account is {}", user.status),
+        )
+        .into_response();
+    }
+
+    // Create access token
+    let access_token = match state
+        .jwt
+        .create_access_token(&user.user_id, &user.username, &state.coord_server_addr)
+    {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(error = %e, "failed to create access token");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+                .into_response();
+        }
+    };
+
+    // Create refresh token
+    let raw_refresh = Uuid::new_v4().to_string();
+    let token_hash = jwt::hash_refresh_token(&raw_refresh);
+    let now = Utc::now();
+
+    let refresh_record = RefreshTokenRecord {
+        token_id: Uuid::new_v4().to_string(),
+        user_id: user.user_id.clone(),
+        token_hash,
+        expires_at: now + chrono::Duration::days(7),
+        created_at: now,
+        revoked_at: None,
+    };
+
+    if let Err(e) = state.db.insert_refresh_token(&refresh_record).await {
+        warn!(error = %e, "failed to store refresh token");
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+    }
+
+    info!(user_id = %user.user_id, "user logged in");
+    Json(LoginResponse {
+        access_token,
+        refresh_token: raw_refresh,
+        token_type: "Bearer".into(),
+        expires_in: 900,
+    })
+    .into_response()
+}
+
+/// POST /api/v1/auth/refresh
+async fn refresh(
+    State(state): State<AppState>,
+    Json(req): Json<RefreshRequest>,
+) -> impl IntoResponse {
+    let token_hash = jwt::hash_refresh_token(&req.refresh_token);
+
+    let stored = match state.db.get_refresh_token_by_hash(&token_hash).await {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            return error_response(StatusCode::UNAUTHORIZED, "invalid refresh token")
+                .into_response()
+        }
+        Err(e) => {
+            warn!(error = %e, "database error during refresh");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+                .into_response();
+        }
+    };
+
+    if stored.expires_at < Utc::now() {
+        // Revoke the expired token
+        let _ = state.db.revoke_refresh_token(&stored.token_id).await;
+        return error_response(StatusCode::UNAUTHORIZED, "refresh token expired").into_response();
+    }
+
+    // Look up user
+    let user = match state.db.get_user(&stored.user_id).await {
+        Ok(Some(u)) => u,
+        Ok(None) => {
+            return error_response(StatusCode::UNAUTHORIZED, "user not found").into_response()
+        }
+        Err(e) => {
+            warn!(error = %e, "database error during refresh");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+                .into_response();
+        }
+    };
+
+    if user.status != "active" {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            format!("account is {}", user.status),
+        )
+        .into_response();
+    }
+
+    // Create new access token
+    let access_token = match state
+        .jwt
+        .create_access_token(&user.user_id, &user.username, &state.coord_server_addr)
+    {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(error = %e, "failed to create access token");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+                .into_response();
+        }
+    };
+
+    Json(RefreshResponse {
+        access_token,
+        token_type: "Bearer".into(),
+        expires_in: 900,
+    })
+    .into_response()
+}
+
+/// GET /api/v1/auth/userinfo
+async fn userinfo(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let token = match extract_token(&headers) {
+        Some(t) => t,
+        None => {
+            return error_response(StatusCode::UNAUTHORIZED, "missing Authorization header")
+                .into_response()
+        }
+    };
+
+    let claims = match state
+        .jwt
+        .validate_access_token(&token, &state.coord_server_addr)
+    {
+        Ok(c) => c,
+        Err(_) => {
+            return error_response(StatusCode::UNAUTHORIZED, "invalid or expired token")
+                .into_response()
+        }
+    };
+
+    let user = match state.db.get_user(&claims.sub).await {
+        Ok(Some(u)) => u,
+        Ok(None) => {
+            return error_response(StatusCode::NOT_FOUND, "user not found").into_response()
+        }
+        Err(e) => {
+            warn!(error = %e, "database error");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+                .into_response();
+        }
+    };
+
+    Json(UserInfoResponse {
+        user_id: user.user_id,
+        username: user.username,
+        display_name: user.display_name,
+        status: user.status,
+    })
+    .into_response()
+}
+
+/// GET /api/v1/.well-known/jwks.json
+async fn jwks(State(state): State<AppState>) -> impl IntoResponse {
+    let pub_key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(&state.jwt.public_key_bytes);
+
+    let jwk = serde_json::json!({
+        "keys": [{
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "use": "sig",
+            "kid": state.jwt.key_id,
+            "x": pub_key_b64,
+        }]
+    });
+
+    Json(jwk).into_response()
 }
