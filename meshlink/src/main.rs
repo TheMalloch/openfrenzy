@@ -231,12 +231,12 @@ async fn run_daemon(
     // Create pipeline channels
     let channels = state::PipelineChannels::new(256);
 
-    // Parse coordination server address
+    // Parse coordination server address (must be IPv4 since our UDP socket is IPv4)
     let coord_addr: std::net::SocketAddr = tokio::net::lookup_host(&config.coordination.server)
         .await
         .context("resolving coordination server")?
-        .next()
-        .context("no addresses for coordination server")?;
+        .find(|addr| addr.is_ipv4())
+        .context("no IPv4 addresses for coordination server")?;
 
     info!("spawning async tasks");
 
