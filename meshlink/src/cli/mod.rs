@@ -1,7 +1,7 @@
 use crate::state::SharedState;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{debug, error, info};
@@ -20,19 +20,20 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Start the meshlink daemon.
+    /// Start the meshlink daemon (registers first if --invite is provided).
     Up {
-        /// Server HTTP base URL for dynamic config (e.g., http://coord.example.com:4001).
+        /// Server HTTP base URL (e.g., http://coord.example.com:4001).
+        /// Required for first-time registration with --invite.
         #[arg(long)]
         server: Option<String>,
 
-        /// Node identifier (from registration).
+        /// Invite code for first-time registration.
         #[arg(long)]
-        node_id: Option<String>,
+        invite: Option<String>,
 
-        /// Authentication token (from registration).
+        /// Optional name for this node (used with --invite).
         #[arg(long)]
-        auth_token: Option<String>,
+        name: Option<String>,
 
         /// Coordination server address for UDP peer discovery (e.g., r.rasporar.org:4000).
         /// Overrides the [coordination] server value in config.
@@ -47,20 +48,6 @@ pub enum Command {
     Peers,
     /// Generate a new keypair.
     Genkey,
-    /// Register this node with a coordination server.
-    Register {
-        /// Server HTTP base URL (e.g., http://coord.example.com:4001).
-        #[arg(long)]
-        server: String,
-
-        /// Invite code from the server admin.
-        #[arg(long)]
-        invite: String,
-
-        /// Optional name for this node.
-        #[arg(long)]
-        name: Option<String>,
-    },
     /// Unregister this node from the coordination server.
     Unregister {
         /// Server HTTP base URL.
@@ -68,7 +55,11 @@ pub enum Command {
         server: Option<String>,
     },
     /// Initialize system directories, group, and permissions for meshlink.
-    Setup,
+    Setup {
+        /// Configuration directory path.
+        #[arg(long, default_value = "/etc/meshlink")]
+        config_dir: PathBuf,
+    },
 }
 
 /// Parameters for server-orchestrated mode, resolved from CLI args, credentials, or env vars.
@@ -79,43 +70,27 @@ pub struct ServerParams {
 }
 
 impl ServerParams {
-    /// Resolve server params from CLI flags, falling back to stored credentials and env vars.
-    pub fn resolve(
-        server: Option<String>,
-        node_id: Option<String>,
-        auth_token: Option<String>,
-    ) -> Option<Self> {
-        // Try CLI args first
-        if let (Some(s), Some(n), Some(t)) = (server.clone(), node_id.clone(), auth_token.clone()) {
+    /// Resolve server params from stored credentials, falling back to env vars.
+    pub fn resolve(config_dir: &Path) -> Option<Self> {
+        // Try credentials file
+        if let Ok(creds) = crate::credentials::Credentials::load(config_dir) {
             return Some(Self {
-                server: s,
-                node_id: n,
-                auth_token: t,
+                server: creds.server,
+                node_id: creds.node_id,
+                auth_token: creds.auth_token,
             });
         }
 
         // Try env vars
-        let server = server
-            .or_else(|| std::env::var("MESHLINK_SERVER").ok());
-        let node_id = node_id
-            .or_else(|| std::env::var("MESHLINK_NODE_ID").ok());
-        let auth_token = auth_token
-            .or_else(|| std::env::var("MESHLINK_AUTH_TOKEN").ok());
+        let server = std::env::var("MESHLINK_SERVER").ok();
+        let node_id = std::env::var("MESHLINK_NODE_ID").ok();
+        let auth_token = std::env::var("MESHLINK_AUTH_TOKEN").ok();
 
-        if let (Some(s), Some(n), Some(t)) = (server.clone(), node_id.clone(), auth_token.clone()) {
+        if let (Some(s), Some(n), Some(t)) = (server, node_id, auth_token) {
             return Some(Self {
                 server: s,
                 node_id: n,
                 auth_token: t,
-            });
-        }
-
-        // Try credentials file
-        if let Ok(creds) = crate::credentials::Credentials::load() {
-            return Some(Self {
-                server: server.unwrap_or(creds.server),
-                node_id: node_id.unwrap_or(creds.node_id),
-                auth_token: auth_token.unwrap_or(creds.auth_token),
             });
         }
 

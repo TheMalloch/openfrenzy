@@ -1,8 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
-
-const DEFAULT_CREDENTIALS_PATH: &str = "/etc/meshlink/credentials.json";
+use std::path::{Path, PathBuf};
 
 /// Stored credentials from a successful registration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -13,9 +11,14 @@ pub struct Credentials {
 }
 
 impl Credentials {
-    /// Save credentials to the default path.
-    pub fn save(&self) -> Result<()> {
-        self.save_to(Path::new(DEFAULT_CREDENTIALS_PATH))
+    /// Return the credentials file path within a config directory.
+    pub fn path_in(config_dir: &Path) -> PathBuf {
+        config_dir.join("credentials.json")
+    }
+
+    /// Save credentials to the given config directory.
+    pub fn save(&self, config_dir: &Path) -> Result<()> {
+        self.save_to(&Self::path_in(config_dir))
     }
 
     /// Save credentials to a specific path.
@@ -48,9 +51,9 @@ impl Credentials {
         Ok(())
     }
 
-    /// Load credentials from the default path.
-    pub fn load() -> Result<Self> {
-        Self::load_from(Path::new(DEFAULT_CREDENTIALS_PATH))
+    /// Load credentials from the given config directory.
+    pub fn load(config_dir: &Path) -> Result<Self> {
+        Self::load_from(&Self::path_in(config_dir))
     }
 
     /// Load credentials from a specific path.
@@ -62,9 +65,9 @@ impl Credentials {
         Ok(creds)
     }
 
-    /// Check if credentials exist at the default path.
-    pub fn exists() -> bool {
-        Path::new(DEFAULT_CREDENTIALS_PATH).exists()
+    /// Check if credentials exist in the given config directory.
+    pub fn exists(config_dir: &Path) -> bool {
+        Self::path_in(config_dir).exists()
     }
 }
 

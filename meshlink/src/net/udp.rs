@@ -10,7 +10,7 @@ use tracing::{debug, error, info};
 /// Returns the socket and the port it actually bound to.
 pub async fn bind_udp(listen_port: u16) -> Result<(UdpSocket, u16)> {
     for port in listen_port..=listen_port.saturating_add(10) {
-        let addr: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
+        let addr: SocketAddr = format!("[::]:{port}").parse().unwrap();
         match UdpSocket::bind(addr).await {
             Ok(socket) => {
                 if port != listen_port {

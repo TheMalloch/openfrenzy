@@ -2,13 +2,10 @@ use anyhow::{bail, Context, Result};
 use std::path::Path;
 use std::process::Command;
 
-const MESHLINK_DIR: &str = "/etc/meshlink";
-const CONFIG_PATH: &str = "/etc/meshlink/config.toml";
-const CREDENTIALS_PATH: &str = "/etc/meshlink/credentials.json";
 const GROUP_NAME: &str = "meshlink";
 
 /// Run the full setup: create group, directory, set permissions, add user.
-pub fn run_setup() -> Result<()> {
+pub fn run_setup(config_dir: &Path) -> Result<()> {
     if !is_root() {
         eprintln!("Error: meshlink setup requires root privileges.");
         eprintln!();
@@ -16,6 +13,12 @@ pub fn run_setup() -> Result<()> {
         eprintln!();
         std::process::exit(1);
     }
+
+    let dir_str = config_dir.display().to_string();
+    let config_path = config_dir.join("config.toml");
+    let config_str = config_path.display().to_string();
+    let creds_path = config_dir.join("credentials.json");
+    let creds_str = creds_path.display().to_string();
 
     let mut actions: Vec<String> = Vec::new();
 
@@ -28,44 +31,43 @@ pub fn run_setup() -> Result<()> {
     }
 
     // Create directory
-    let dir = Path::new(MESHLINK_DIR);
-    if !dir.exists() {
-        std::fs::create_dir_all(dir).context("creating /etc/meshlink")?;
-        actions.push(format!("Created directory {MESHLINK_DIR}"));
+    if !config_dir.exists() {
+        std::fs::create_dir_all(config_dir)
+            .with_context(|| format!("creating {dir_str}"))?;
+        actions.push(format!("Created directory {dir_str}"));
     } else {
-        actions.push(format!("Directory {MESHLINK_DIR} already exists (skipped)"));
+        actions.push(format!("Directory {dir_str} already exists (skipped)"));
     }
 
     // Set directory ownership and permissions (root:meshlink, 2775 = setgid)
-    chown(MESHLINK_DIR, "root", GROUP_NAME)?;
-    chmod(MESHLINK_DIR, "2775")?;
+    chown(&dir_str, "root", GROUP_NAME)?;
+    chmod(&dir_str, "2775")?;
     actions.push(format!(
-        "Set {MESHLINK_DIR} ownership to root:{GROUP_NAME} mode 2775"
+        "Set {dir_str} ownership to root:{GROUP_NAME} mode 2775"
     ));
 
     // Create config.toml placeholder if missing
-    let config_path = Path::new(CONFIG_PATH);
     if !config_path.exists() {
-        std::fs::write(config_path, minimal_config_template()).context("creating config.toml")?;
-        actions.push(format!("Created {CONFIG_PATH} (template)"));
+        std::fs::write(&config_path, minimal_config_template())
+            .context("creating config.toml")?;
+        actions.push(format!("Created {config_str} (template)"));
     } else {
-        actions.push(format!("{CONFIG_PATH} already exists (skipped creation)"));
+        actions.push(format!("{config_str} already exists (skipped creation)"));
     }
 
     // Set config file ownership and permissions (root:meshlink, 0664)
-    chown(CONFIG_PATH, "root", GROUP_NAME)?;
-    chmod(CONFIG_PATH, "0664")?;
+    chown(&config_str, "root", GROUP_NAME)?;
+    chmod(&config_str, "0664")?;
     actions.push(format!(
-        "Set {CONFIG_PATH} ownership to root:{GROUP_NAME} mode 0664"
+        "Set {config_str} ownership to root:{GROUP_NAME} mode 0664"
     ));
 
     // Fix credentials.json permissions if it exists
-    let creds_path = Path::new(CREDENTIALS_PATH);
     if creds_path.exists() {
-        chown(CREDENTIALS_PATH, "root", GROUP_NAME)?;
-        chmod(CREDENTIALS_PATH, "0660")?;
+        chown(&creds_str, "root", GROUP_NAME)?;
+        chmod(&creds_str, "0660")?;
         actions.push(format!(
-            "Set {CREDENTIALS_PATH} ownership to root:{GROUP_NAME} mode 0660"
+            "Set {creds_str} ownership to root:{GROUP_NAME} mode 0660"
         ));
     }
 
@@ -85,7 +87,7 @@ pub fn run_setup() -> Result<()> {
     }
     println!();
     println!("You may need to log out and back in for group membership to take effect.");
-    println!("Then run: meshlink register --server <URL> --invite <CODE>");
+    println!("Then run: sudo meshlink up --server <URL> --invite <CODE>");
 
     Ok(())
 }
@@ -169,7 +171,7 @@ fn get_sudo_user() -> Option<String> {
 fn minimal_config_template() -> &'static str {
     "# MeshLink configuration\n\
      # This file will be populated during registration.\n\
-     # Run: meshlink register --server <URL> --invite <CODE>\n"
+     # Run: sudo meshlink up --server <URL> --invite <CODE>\n"
 }
 
 #[cfg(test)]

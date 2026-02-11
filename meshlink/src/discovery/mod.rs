@@ -15,7 +15,7 @@ mod proto {
     pub const REGISTER: u8 = 0x30;
     /// Peer list request: [0x31][pub_key: 32]
     pub const PEER_LIST_REQ: u8 = 0x31;
-    /// Peer list response: [0x32][count: 2]([pub_key: 32][ip: 4][port: 2])*
+    /// Peer list response: [0x32][count: 2]([pub_key: 32][type: 1][ip: 4|16][port: 2])*
     pub const PEER_LIST_RESP: u8 = 0x32;
     /// Keepalive: [0x33][pub_key: 32]
     pub const KEEPALIVE: u8 = 0x33;
@@ -63,35 +63,50 @@ fn parse_peer_list(data: &[u8]) -> Result<Vec<DiscoveredPeer>> {
     }
 
     let count = u16::from_be_bytes([data[1], data[2]]) as usize;
-    let entry_size = 32 + 4 + 2; // pub_key + ipv4 + port
-    let expected_len = 3 + count * entry_size;
-
-    if data.len() < expected_len {
-        anyhow::bail!(
-            "peer list truncated: expected {} bytes, got {}",
-            expected_len,
-            data.len()
-        );
-    }
 
     let mut peers = Vec::with_capacity(count);
-    for i in 0..count {
-        let offset = 3 + i * entry_size;
+    let mut offset = 3;
+    for _ in 0..count {
+        if offset + 33 > data.len() {
+            anyhow::bail!("peer list truncated at entry header");
+        }
 
         let mut public_key = [0u8; 32];
         public_key.copy_from_slice(&data[offset..offset + 32]);
+        let addr_type = data[offset + 32];
+        offset += 33;
 
-        let ip = std::net::Ipv4Addr::new(
-            data[offset + 32],
-            data[offset + 33],
-            data[offset + 34],
-            data[offset + 35],
-        );
-        let port = u16::from_be_bytes([data[offset + 36], data[offset + 37]]);
+        let endpoint = match addr_type {
+            0x04 => {
+                if offset + 6 > data.len() {
+                    anyhow::bail!("peer list truncated at IPv4 entry");
+                }
+                let ip = std::net::Ipv4Addr::new(
+                    data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+                );
+                let port = u16::from_be_bytes([data[offset + 4], data[offset + 5]]);
+                offset += 6;
+                SocketAddr::new(std::net::IpAddr::V4(ip), port)
+            }
+            0x06 => {
+                if offset + 18 > data.len() {
+                    anyhow::bail!("peer list truncated at IPv6 entry");
+                }
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&data[offset..offset + 16]);
+                let ip = std::net::Ipv6Addr::from(octets);
+                let port = u16::from_be_bytes([data[offset + 16], data[offset + 17]]);
+                offset += 18;
+                SocketAddr::new(std::net::IpAddr::V6(ip), port)
+            }
+            _ => {
+                anyhow::bail!("unknown address type 0x{:02x} in peer list", addr_type);
+            }
+        };
 
         peers.push(DiscoveredPeer {
             public_key,
-            endpoint: SocketAddr::new(std::net::IpAddr::V4(ip), port),
+            endpoint,
         });
     }
 

@@ -56,7 +56,7 @@ async fn main() -> Result<()> {
     // Also allow passing UDP address as CLI arg for backward compatibility
     let udp_addr = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| format!("0.0.0.0:{udp_port}"));
+        .unwrap_or_else(|| format!("[::]:{udp_port}"));
 
     // Connect to PostgreSQL and run migrations
     let database = db::Db::connect(&database_url).await?;
@@ -81,7 +81,7 @@ async fn main() -> Result<()> {
     let app = api::router(app_state);
 
     // Start HTTP server
-    let http_addr: SocketAddr = format!("0.0.0.0:{http_port}").parse()?;
+    let http_addr: SocketAddr = format!("[::]:{http_port}").parse()?;
     let http_listener = tokio::net::TcpListener::bind(http_addr).await?;
     info!(%http_addr, "HTTP API server starting");
 
@@ -187,10 +187,13 @@ async fn handle_nat_detect(socket: &UdpSocket, src: SocketAddr) {
 
     let mut resp = vec![proto::NAT_DETECT_RESP];
     match src.ip() {
-        std::net::IpAddr::V4(ip) => resp.extend_from_slice(&ip.octets()),
-        std::net::IpAddr::V6(_) => {
-            warn!(%src, "IPv6 NAT detection not supported");
-            return;
+        std::net::IpAddr::V4(ip) => {
+            resp.push(0x04);
+            resp.extend_from_slice(&ip.octets());
+        }
+        std::net::IpAddr::V6(ip) => {
+            resp.push(0x06);
+            resp.extend_from_slice(&ip.octets());
         }
     }
     resp.extend_from_slice(&src.port().to_be_bytes());
@@ -264,8 +267,8 @@ async fn handle_peer_list_req(
         .collect();
 
     let count = other_peers.len().min(u16::MAX as usize);
-    let entry_size = 32 + 4 + 2;
-    let mut resp = Vec::with_capacity(3 + count * entry_size);
+    // Variable-size entries: pub_key(32) + type(1) + ip(4 or 16) + port(2)
+    let mut resp = Vec::with_capacity(3 + count * (32 + 1 + 16 + 2));
 
     resp.push(proto::PEER_LIST_RESP);
     resp.extend_from_slice(&(count as u16).to_be_bytes());
@@ -273,9 +276,13 @@ async fn handle_peer_list_req(
     for peer in other_peers.iter().take(count) {
         resp.extend_from_slice(&peer.public_key);
         match peer.endpoint.ip() {
-            std::net::IpAddr::V4(ip) => resp.extend_from_slice(&ip.octets()),
-            std::net::IpAddr::V6(_) => {
-                continue;
+            std::net::IpAddr::V4(ip) => {
+                resp.push(0x04);
+                resp.extend_from_slice(&ip.octets());
+            }
+            std::net::IpAddr::V6(ip) => {
+                resp.push(0x06);
+                resp.extend_from_slice(&ip.octets());
             }
         }
         resp.extend_from_slice(&peer.endpoint.port().to_be_bytes());

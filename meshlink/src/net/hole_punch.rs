@@ -42,12 +42,12 @@ pub async fn detect_nat(
         .await
         .context("sending NAT probe")?;
 
-    // Wait for response: [0x11][4 bytes IP][2 bytes port]
-    let mut buf = [0u8; 16];
+    // Wait for response: [0x11][type: 1][ip: 4|16][port: 2]
+    let mut buf = [0u8; 32];
     let result = timeout(Duration::from_secs(5), async {
         loop {
             let (n, src) = socket.recv_from(&mut buf).await?;
-            if src == *coord_server && n >= 7 && buf[0] == 0x11 {
+            if src == *coord_server && n >= 8 && buf[0] == 0x11 {
                 return Ok::<_, anyhow::Error>(n);
             }
         }
@@ -55,10 +55,28 @@ pub async fn detect_nat(
     .await;
 
     match result {
-        Ok(Ok(n)) if n >= 7 => {
-            let ip = std::net::Ipv4Addr::new(buf[1], buf[2], buf[3], buf[4]);
-            let port = u16::from_be_bytes([buf[5], buf[6]]);
-            let public_endpoint = SocketAddr::new(std::net::IpAddr::V4(ip), port);
+        Ok(Ok(n)) if n >= 8 => {
+            let public_endpoint = match buf[1] {
+                0x04 if n >= 8 => {
+                    let ip = std::net::Ipv4Addr::new(buf[2], buf[3], buf[4], buf[5]);
+                    let port = u16::from_be_bytes([buf[6], buf[7]]);
+                    SocketAddr::new(std::net::IpAddr::V4(ip), port)
+                }
+                0x06 if n >= 20 => {
+                    let mut octets = [0u8; 16];
+                    octets.copy_from_slice(&buf[2..18]);
+                    let ip = std::net::Ipv6Addr::from(octets);
+                    let port = u16::from_be_bytes([buf[18], buf[19]]);
+                    SocketAddr::new(std::net::IpAddr::V6(ip), port)
+                }
+                _ => {
+                    warn!(addr_type = buf[1], "unknown address type in NAT detection response");
+                    return Ok(NatDetection {
+                        nat_type: NatType::Unknown,
+                        public_endpoint: None,
+                    });
+                }
+            };
 
             let local_addr = socket.local_addr()?;
             let nat_type = if local_addr.ip().is_unspecified() {

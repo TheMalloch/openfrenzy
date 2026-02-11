@@ -13,6 +13,7 @@ mod tun;
 use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{Cli, Command};
+use std::path::Path;
 use std::sync::Arc;
 use tracing::info;
 
@@ -47,27 +48,62 @@ async fn main() -> Result<()> {
             println!("Sending shutdown signal...");
             return Ok(());
         }
-        Some(Command::Register {
-            server,
-            invite,
-            name,
-        }) => {
-            return handle_register(&server, &invite, name.as_deref()).await;
-        }
         Some(Command::Unregister { server }) => {
-            return handle_unregister(server.as_deref()).await;
+            let config_dir = cli.config.parent().unwrap_or(Path::new("/etc/meshlink"));
+            return handle_unregister(server.as_deref(), config_dir).await;
         }
-        Some(Command::Setup) => {
-            setup::run_setup()?;
+        Some(Command::Setup { config_dir }) => {
+            setup::run_setup(&config_dir)?;
             return Ok(());
         }
         Some(Command::Up {
             server,
-            node_id,
-            auth_token,
+            invite,
+            name,
             coord_server,
         }) => {
-            let server_params = cli::ServerParams::resolve(server, node_id, auth_token);
+            let config_dir = cli.config.parent().unwrap_or(Path::new("/etc/meshlink"));
+
+            // If --invite is provided, register first
+            if let Some(invite_code) = invite {
+                let server_url = server.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("--server is required when using --invite")
+                })?;
+
+                info!("registering with server {server_url}");
+                let client = api_client::ApiClient::new(server_url, None);
+                let resp = client.register(&invite_code, name.as_deref()).await?;
+
+                // Save credentials
+                let creds = credentials::Credentials {
+                    server: server_url.to_string(),
+                    node_id: resp.node_id.clone(),
+                    auth_token: resp.auth_token.clone(),
+                };
+                creds.save(config_dir)?;
+
+                // Write the config file
+                if let Some(parent) = cli.config.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| wrap_permission_error(e, "creating config directory"))?;
+                }
+                std::fs::write(&cli.config, &resp.config_toml)
+                    .map_err(|e| wrap_permission_error(e, "writing config file"))?;
+
+                println!("Registration successful!");
+                println!("  Node ID:    {}", resp.node_id);
+                println!("  Virtual IP: {}", resp.virtual_ip);
+                println!("  Public Key: {}", resp.public_key);
+                println!();
+            }
+
+            let server_params = cli::ServerParams::resolve(config_dir);
+            if server_params.is_none() {
+                anyhow::bail!(
+                    "No credentials found. Register first with:\n  \
+                     sudo meshlink up --server <URL> --invite <CODE>"
+                );
+            }
             run_daemon(&cli.config, server_params, coord_server).await?;
         }
         None => {
@@ -79,46 +115,9 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Handle the `register` subcommand.
-async fn handle_register(server: &str, invite_code: &str, name: Option<&str>) -> Result<()> {
-    info!("registering with server {server}");
-
-    let client = api_client::ApiClient::new(server, None);
-    let resp = client.register(invite_code, name).await?;
-
-    // Save credentials
-    let creds = credentials::Credentials {
-        server: server.to_string(),
-        node_id: resp.node_id.clone(),
-        auth_token: resp.auth_token.clone(),
-    };
-    creds.save()?;
-
-    // Write the config file
-    let config_path = std::path::Path::new("/etc/meshlink/config.toml");
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| wrap_permission_error(e, "creating /etc/meshlink"))?;
-    }
-    std::fs::write(config_path, &resp.config_toml)
-        .map_err(|e| wrap_permission_error(e, "writing config file"))?;
-
-    println!("Registration successful!");
-    println!("  Node ID:    {}", resp.node_id);
-    println!("  Virtual IP: {}", resp.virtual_ip);
-    println!("  Public Key: {}", resp.public_key);
-    println!();
-    println!("Config written to /etc/meshlink/config.toml");
-    println!("Credentials saved to /etc/meshlink/credentials.json");
-    println!();
-    println!("Start the daemon with: sudo meshlink up");
-
-    Ok(())
-}
-
 /// Handle the `unregister` subcommand.
-async fn handle_unregister(server: Option<&str>) -> Result<()> {
-    let creds = credentials::Credentials::load()
+async fn handle_unregister(server: Option<&str>, config_dir: &Path) -> Result<()> {
+    let creds = credentials::Credentials::load(config_dir)
         .context("no credentials found — are you registered?")?;
 
     let server_url = server.unwrap_or(&creds.server);
@@ -127,7 +126,7 @@ async fn handle_unregister(server: Option<&str>) -> Result<()> {
     client.unregister(&creds.node_id).await?;
 
     // Clean up local files
-    let _ = std::fs::remove_file("/etc/meshlink/credentials.json");
+    let _ = std::fs::remove_file(credentials::Credentials::path_in(config_dir));
 
     println!("Node {} unregistered successfully.", creds.node_id);
     Ok(())
@@ -231,12 +230,12 @@ async fn run_daemon(
     // Create pipeline channels
     let channels = state::PipelineChannels::new(256);
 
-    // Parse coordination server address (must be IPv4 since our UDP socket is IPv4)
+    // Parse coordination server address (prefer IPv6 for dual-stack, fall back to IPv4)
     let coord_addr: std::net::SocketAddr = tokio::net::lookup_host(&config.coordination.server)
         .await
         .context("resolving coordination server")?
-        .find(|addr| addr.is_ipv4())
-        .context("no IPv4 addresses for coordination server")?;
+        .next()
+        .context("no addresses for coordination server")?;
 
     info!("spawning async tasks");
 
