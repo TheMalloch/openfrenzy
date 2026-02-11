@@ -158,11 +158,12 @@ async fn handle_handshake(
             state.set_peer_endpoint(&peer_static_pub, src).await;
             state.set_session_key(&peer_static_pub, session_key).await;
 
-            // Send response with our own ephemeral key
-            let result = handshake::initiate_handshake(&peer_static_pub);
+            // Send response so initiator knows we completed the handshake.
+            // Include our static pub key for identity; ephemeral is zeroed since
+            // both sides already derived the session key from the initiation.
             let response = handshake::build_handshake_response(
                 &identity.public_key_bytes(),
-                &result.ephemeral_public,
+                &[0u8; 32],
             );
 
             let _ = udp_tx
@@ -172,12 +173,12 @@ async fn handle_handshake(
                 })
                 .await;
         }
-        Ok((handshake::HandshakeType::Response, peer_static_pub, peer_ephemeral_pub)) => {
+        Ok((handshake::HandshakeType::Response, peer_static_pub, _peer_ephemeral_pub)) => {
             debug!(%src, "received handshake response");
 
-            let session_key = handshake::respond_handshake(identity, &peer_ephemeral_pub);
+            // Don't recompute session key — we already derived and stored it
+            // when we initiated the handshake. Just confirm the peer's endpoint.
             state.set_peer_endpoint(&peer_static_pub, src).await;
-            state.set_session_key(&peer_static_pub, session_key).await;
         }
         Err(e) => {
             warn!(error = %e, %src, "failed to parse handshake");
