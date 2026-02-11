@@ -1,5 +1,5 @@
 use crate::config_generator;
-use crate::db::{Db, NodeRecord};
+use crate::db::{AccessRuleRecord, Db, NodeRecord, ServiceRecord};
 use crate::ip_allocator::IpAllocator;
 use crate::key_manager;
 use axum::extract::{ConnectInfo, Path, State};
@@ -20,6 +20,7 @@ pub struct AppState {
     pub db: Db,
     pub ip_allocator: IpAllocator,
     pub coord_server_addr: String,
+    pub admin_token: Option<String>,
 }
 
 /// Build the Axum router with all API routes.
@@ -30,6 +31,16 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/node/{id}/heartbeat", post(heartbeat))
         .route("/api/v1/node/{id}", delete(deregister))
         .route("/api/v1/admin/invite", post(create_invite))
+        // Service management (peer auth)
+        .route("/api/v1/node/{id}/services", post(create_service))
+        .route("/api/v1/node/{id}/services", get(list_services))
+        .route("/api/v1/node/{id}/services/{svc_id}", delete(delete_service))
+        .route("/api/v1/node/{id}/services/{svc_id}/rules", post(create_peer_rule))
+        .route("/api/v1/node/{id}/services/{svc_id}/rules", get(list_rules))
+        .route("/api/v1/node/{id}/services/{svc_id}/rules/{rule_id}", delete(delete_rule))
+        // Admin override endpoints
+        .route("/api/v1/admin/services/{svc_id}/rules", post(admin_create_rule))
+        .route("/api/v1/admin/services/{svc_id}/rules/{rule_id}", delete(admin_delete_rule))
         .with_state(state)
 }
 
@@ -65,6 +76,29 @@ struct InviteResponse {
 #[derive(Serialize)]
 struct ErrorResponse {
     error: String,
+}
+
+#[derive(Deserialize)]
+struct CreateServiceRequest {
+    name: String,
+    port: u16,
+    #[serde(default = "default_protocol")]
+    protocol: String,
+}
+
+fn default_protocol() -> String {
+    "tcp".into()
+}
+
+#[derive(Deserialize)]
+struct CreateRuleRequest {
+    target_peer_id: String,
+    #[serde(default = "default_allow")]
+    rule_type: String,
+}
+
+fn default_allow() -> String {
+    "allow".into()
 }
 
 fn error_response(status: StatusCode, msg: impl Into<String>) -> impl IntoResponse {
@@ -106,10 +140,29 @@ async fn validate_auth(db: &Db, node_id: &str, headers: &HeaderMap) -> Result<No
     Ok(node)
 }
 
+/// Validate the admin token from the Authorization header.
+fn validate_admin_token(
+    admin_token: &Option<String>,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let configured = admin_token.as_ref().ok_or_else(|| {
+        (StatusCode::FORBIDDEN, Json(ErrorResponse { error: "admin API disabled".into() }))
+    })?;
+
+    let provided = extract_token(headers).ok_or_else(|| {
+        (StatusCode::UNAUTHORIZED, Json(ErrorResponse { error: "missing Authorization header".into() }))
+    })?;
+
+    if provided != *configured {
+        return Err((StatusCode::UNAUTHORIZED, Json(ErrorResponse { error: "invalid admin token".into() })));
+    }
+
+    Ok(())
+}
+
 // --- Handlers ---
 
 /// POST /api/v1/register
-/// Register a new node with an invite code.
 async fn register(
     State(state): State<AppState>,
     Json(req): Json<RegisterRequest>,
@@ -183,12 +236,14 @@ async fn register(
         warn!(error = %e, "failed to mark invite as used");
     }
 
-    // Generate config
+    // Generate config (fresh node, no ACL rules yet)
     let active_nodes = state.db.list_active_nodes().await.unwrap_or_default();
     let config_toml = config_generator::generate_config(
         &node_record,
         &active_nodes,
         &state.coord_server_addr,
+        &[],
+        &[],
     );
 
     let private_key_b64 = base64::engine::general_purpose::STANDARD.encode(private_key);
@@ -211,7 +266,6 @@ async fn register(
 }
 
 /// GET /api/v1/node/:id/config
-/// Fetch the current TOML config for a node.
 async fn get_config(
     State(state): State<AppState>,
     Path(node_id): Path<String>,
@@ -230,12 +284,20 @@ async fn get_config(
         }
     };
 
-    let config = config_generator::generate_config(&node, &active_nodes, &state.coord_server_addr);
+    let outbound_acl = state.db.resolve_acl_for_peer(&node_id).await.unwrap_or_default();
+    let inbound_acl = state.db.resolve_inbound_acl_for_owner(&node_id).await.unwrap_or_default();
+
+    let config = config_generator::generate_config(
+        &node,
+        &active_nodes,
+        &state.coord_server_addr,
+        &outbound_acl,
+        &inbound_acl,
+    );
     (StatusCode::OK, config).into_response()
 }
 
 /// POST /api/v1/node/:id/heartbeat
-/// Update the node's last_seen timestamp and endpoint.
 async fn heartbeat(
     State(state): State<AppState>,
     Path(node_id): Path<String>,
@@ -260,7 +322,6 @@ async fn heartbeat(
 
     // Build the endpoint from the client's real IP and the node's configured listen port.
     let endpoint_str = if client_ip.contains(':') {
-        // IPv6: use bracket notation
         format!("[{}]:{}", client_ip, node.listen_port)
     } else {
         format!("{}:{}", client_ip, node.listen_port)
@@ -281,7 +342,6 @@ async fn heartbeat(
 }
 
 /// DELETE /api/v1/node/:id
-/// Deregister a node, releasing its IP.
 async fn deregister(
     State(state): State<AppState>,
     Path(node_id): Path<String>,
@@ -301,7 +361,6 @@ async fn deregister(
 }
 
 /// POST /api/v1/admin/invite
-/// Create a new invite code (basic admin endpoint).
 async fn create_invite(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
@@ -323,4 +382,316 @@ async fn create_invite(
         }),
     )
         .into_response()
+}
+
+// --- Service management handlers (peer auth) ---
+
+/// POST /api/v1/node/:id/services
+async fn create_service(
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<CreateServiceRequest>,
+) -> impl IntoResponse {
+    if let Err(resp) = validate_auth(&state.db, &node_id, &headers).await {
+        return resp.into_response();
+    }
+
+    if !matches!(req.protocol.as_str(), "tcp" | "udp" | "both") {
+        return error_response(StatusCode::BAD_REQUEST, "protocol must be tcp, udp, or both").into_response();
+    }
+
+    if req.port == 0 {
+        return error_response(StatusCode::BAD_REQUEST, "port must be 1-65535").into_response();
+    }
+
+    let service = ServiceRecord {
+        id: Uuid::new_v4().to_string(),
+        peer_id: node_id.clone(),
+        name: req.name,
+        port: req.port as i32,
+        protocol: req.protocol,
+        created_at: Utc::now(),
+    };
+
+    if let Err(e) = state.db.insert_service(&service).await {
+        warn!(error = %e, "failed to create service");
+        return error_response(StatusCode::CONFLICT, "service already exists for this port/protocol").into_response();
+    }
+
+    info!(service_id = %service.id, node_id = %node_id, "service created");
+    (StatusCode::CREATED, Json(service)).into_response()
+}
+
+/// GET /api/v1/node/:id/services
+async fn list_services(
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(resp) = validate_auth(&state.db, &node_id, &headers).await {
+        return resp.into_response();
+    }
+
+    match state.db.list_services_for_peer(&node_id).await {
+        Ok(services) => Json(services).into_response(),
+        Err(e) => {
+            warn!(error = %e, "failed to list services");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
+    }
+}
+
+/// DELETE /api/v1/node/:id/services/:svc_id
+async fn delete_service(
+    State(state): State<AppState>,
+    Path((node_id, svc_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(resp) = validate_auth(&state.db, &node_id, &headers).await {
+        return resp.into_response();
+    }
+
+    // Verify service ownership
+    let service = match state.db.get_service(&svc_id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return error_response(StatusCode::NOT_FOUND, "service not found").into_response(),
+        Err(e) => {
+            warn!(error = %e, "database error");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    };
+
+    if service.peer_id != node_id {
+        return error_response(StatusCode::FORBIDDEN, "not your service").into_response();
+    }
+
+    if let Err(e) = state.db.delete_service(&svc_id).await {
+        warn!(error = %e, "failed to delete service");
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+    }
+
+    info!(service_id = %svc_id, "service deleted");
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// POST /api/v1/node/:id/services/:svc_id/rules
+async fn create_peer_rule(
+    State(state): State<AppState>,
+    Path((node_id, svc_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(req): Json<CreateRuleRequest>,
+) -> impl IntoResponse {
+    if let Err(resp) = validate_auth(&state.db, &node_id, &headers).await {
+        return resp.into_response();
+    }
+
+    // Verify service ownership
+    let service = match state.db.get_service(&svc_id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return error_response(StatusCode::NOT_FOUND, "service not found").into_response(),
+        Err(e) => {
+            warn!(error = %e, "database error");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    };
+
+    if service.peer_id != node_id {
+        return error_response(StatusCode::FORBIDDEN, "not your service").into_response();
+    }
+
+    if !matches!(req.rule_type.as_str(), "allow" | "deny") {
+        return error_response(StatusCode::BAD_REQUEST, "rule_type must be allow or deny").into_response();
+    }
+
+    // Verify target peer exists and is active
+    match state.db.get_node(&req.target_peer_id).await {
+        Ok(Some(n)) if n.status != "deregistered" => {}
+        Ok(Some(_)) => return error_response(StatusCode::BAD_REQUEST, "target peer is deregistered").into_response(),
+        Ok(None) => return error_response(StatusCode::BAD_REQUEST, "target peer not found").into_response(),
+        Err(e) => {
+            warn!(error = %e, "database error");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    }
+
+    let rule = AccessRuleRecord {
+        id: Uuid::new_v4().to_string(),
+        service_id: svc_id,
+        target_peer_id: req.target_peer_id,
+        granted_by: "owner".into(),
+        rule_type: req.rule_type,
+        created_at: Utc::now(),
+    };
+
+    if let Err(e) = state.db.upsert_access_rule(&rule).await {
+        warn!(error = %e, "failed to create rule");
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+    }
+
+    info!(rule_id = %rule.id, "peer rule created");
+    (StatusCode::CREATED, Json(rule)).into_response()
+}
+
+/// GET /api/v1/node/:id/services/:svc_id/rules
+async fn list_rules(
+    State(state): State<AppState>,
+    Path((node_id, svc_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(resp) = validate_auth(&state.db, &node_id, &headers).await {
+        return resp.into_response();
+    }
+
+    // Verify service ownership
+    let service = match state.db.get_service(&svc_id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return error_response(StatusCode::NOT_FOUND, "service not found").into_response(),
+        Err(e) => {
+            warn!(error = %e, "database error");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    };
+
+    if service.peer_id != node_id {
+        return error_response(StatusCode::FORBIDDEN, "not your service").into_response();
+    }
+
+    match state.db.list_rules_for_service(&svc_id).await {
+        Ok(rules) => Json(rules).into_response(),
+        Err(e) => {
+            warn!(error = %e, "failed to list rules");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
+    }
+}
+
+/// DELETE /api/v1/node/:id/services/:svc_id/rules/:rule_id
+async fn delete_rule(
+    State(state): State<AppState>,
+    Path((node_id, svc_id, rule_id)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(resp) = validate_auth(&state.db, &node_id, &headers).await {
+        return resp.into_response();
+    }
+
+    // Verify service ownership
+    let service = match state.db.get_service(&svc_id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return error_response(StatusCode::NOT_FOUND, "service not found").into_response(),
+        Err(e) => {
+            warn!(error = %e, "database error");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    };
+
+    if service.peer_id != node_id {
+        return error_response(StatusCode::FORBIDDEN, "not your service").into_response();
+    }
+
+    // Verify rule exists and is owner-granted (peers can't delete admin rules)
+    let rule = match state.db.get_access_rule(&rule_id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return error_response(StatusCode::NOT_FOUND, "rule not found").into_response(),
+        Err(e) => {
+            warn!(error = %e, "database error");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    };
+
+    if rule.service_id != svc_id {
+        return error_response(StatusCode::NOT_FOUND, "rule not found for this service").into_response();
+    }
+
+    if rule.granted_by != "owner" {
+        return error_response(StatusCode::FORBIDDEN, "cannot delete admin rules").into_response();
+    }
+
+    if let Err(e) = state.db.delete_access_rule(&rule_id).await {
+        warn!(error = %e, "failed to delete rule");
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+    }
+
+    info!(rule_id = %rule_id, "rule deleted");
+    StatusCode::NO_CONTENT.into_response()
+}
+
+// --- Admin override handlers ---
+
+/// POST /api/v1/admin/services/:svc_id/rules
+async fn admin_create_rule(
+    State(state): State<AppState>,
+    Path(svc_id): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<CreateRuleRequest>,
+) -> impl IntoResponse {
+    if let Err(resp) = validate_admin_token(&state.admin_token, &headers) {
+        return resp.into_response();
+    }
+
+    // Verify service exists
+    if let Ok(None) | Err(_) = state.db.get_service(&svc_id).await {
+        return error_response(StatusCode::NOT_FOUND, "service not found").into_response();
+    }
+
+    if !matches!(req.rule_type.as_str(), "allow" | "deny") {
+        return error_response(StatusCode::BAD_REQUEST, "rule_type must be allow or deny").into_response();
+    }
+
+    // Verify target peer exists
+    match state.db.get_node(&req.target_peer_id).await {
+        Ok(Some(_)) => {}
+        _ => return error_response(StatusCode::BAD_REQUEST, "target peer not found").into_response(),
+    }
+
+    let rule = AccessRuleRecord {
+        id: Uuid::new_v4().to_string(),
+        service_id: svc_id,
+        target_peer_id: req.target_peer_id,
+        granted_by: "admin".into(),
+        rule_type: req.rule_type,
+        created_at: Utc::now(),
+    };
+
+    if let Err(e) = state.db.upsert_access_rule(&rule).await {
+        warn!(error = %e, "failed to create admin rule");
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+    }
+
+    info!(rule_id = %rule.id, "admin rule created");
+    (StatusCode::CREATED, Json(rule)).into_response()
+}
+
+/// DELETE /api/v1/admin/services/:svc_id/rules/:rule_id
+async fn admin_delete_rule(
+    State(state): State<AppState>,
+    Path((svc_id, rule_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(resp) = validate_admin_token(&state.admin_token, &headers) {
+        return resp.into_response();
+    }
+
+    // Verify rule exists and belongs to this service
+    let rule = match state.db.get_access_rule(&rule_id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return error_response(StatusCode::NOT_FOUND, "rule not found").into_response(),
+        Err(e) => {
+            warn!(error = %e, "database error");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    };
+
+    if rule.service_id != svc_id {
+        return error_response(StatusCode::NOT_FOUND, "rule not found for this service").into_response();
+    }
+
+    if let Err(e) = state.db.delete_access_rule(&rule_id).await {
+        warn!(error = %e, "failed to delete admin rule");
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+    }
+
+    info!(rule_id = %rule_id, "admin rule deleted");
+    StatusCode::NO_CONTENT.into_response()
 }

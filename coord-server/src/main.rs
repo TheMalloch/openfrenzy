@@ -71,11 +71,18 @@ async fn main() -> Result<()> {
     let coord_server_addr = std::env::var("COORD_SERVER_ADDR")
         .unwrap_or_else(|_| format!("0.0.0.0:{udp_port}"));
 
+    // Optional admin token for IAM override endpoints
+    let admin_token = std::env::var("ADMIN_TOKEN").ok();
+    if admin_token.is_some() {
+        info!("admin API enabled (ADMIN_TOKEN set)");
+    }
+
     // Build API state and router
     let app_state = api::AppState {
         db: database.clone(),
         ip_allocator,
         coord_server_addr,
+        admin_token,
     };
 
     let app = api::router(app_state);

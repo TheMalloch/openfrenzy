@@ -206,6 +206,14 @@ async fn run_daemon(
             .map(|net| net.addr())
             .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
 
+        // Collect outbound ACL rules matching this peer's virtual IP
+        let peer_acl: Vec<config::AclRule> = config
+            .acl
+            .iter()
+            .filter(|r| r.peer_ip == virtual_ip)
+            .cloned()
+            .collect();
+
         let peer_info = state::PeerInfo {
             public_key: pub_key_bytes,
             endpoint: peer_config.endpoint,
@@ -215,8 +223,15 @@ async fn run_daemon(
             last_handshake: None,
             tx_bytes: 0,
             rx_bytes: 0,
+            acl_rules: peer_acl,
         };
         shared_state.add_peer(peer_info).await;
+    }
+
+    // Load inbound ACL rules
+    if !config.inbound_acl.is_empty() {
+        info!(rules = config.inbound_acl.len(), "loading inbound ACL rules");
+        *shared_state.inbound_acl.write().await = config.inbound_acl.clone();
     }
 
     // Create TUN device

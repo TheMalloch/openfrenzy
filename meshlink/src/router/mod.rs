@@ -3,6 +3,40 @@ use crate::state::{RoutedPacket, SharedState};
 use tokio::sync::mpsc;
 use tracing::{debug, error, trace, warn};
 
+/// Extract L4 (transport layer) info from an IPv4 packet.
+/// Returns (IP protocol number, source port, destination port).
+/// TCP=6, UDP=17. Returns None for non-TCP/UDP or if packet is too short.
+fn extract_l4_info(packet: &[u8]) -> Option<(u8, u16, u16)> {
+    if packet.len() < 20 {
+        return None;
+    }
+    let version = packet[0] >> 4;
+    if version != 4 {
+        return None;
+    }
+    let ihl = (packet[0] & 0x0F) as usize * 4;
+    let protocol = packet[9];
+    // Only extract ports for TCP (6) and UDP (17)
+    if protocol != 6 && protocol != 17 {
+        return None;
+    }
+    if packet.len() < ihl + 4 {
+        return None;
+    }
+    let src_port = u16::from_be_bytes([packet[ihl], packet[ihl + 1]]);
+    let dst_port = u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]);
+    Some((protocol, src_port, dst_port))
+}
+
+/// Convert IP protocol number to name.
+fn protocol_name(proto: u8) -> &'static str {
+    match proto {
+        6 => "tcp",
+        17 => "udp",
+        _ => "unknown",
+    }
+}
+
 /// Extract the destination IPv4 address from a raw IP packet.
 fn extract_dest_ip(packet: &[u8]) -> Option<std::net::Ipv4Addr> {
     // IPv4: version+IHL at byte 0, dest IP at bytes 16..20
@@ -86,6 +120,15 @@ pub async fn outbound_router_task(
                 continue;
             }
         };
+
+        // Outbound ACL check: only for TCP/UDP, ICMP passes through
+        if let Some((proto, _src_port, dst_port)) = extract_l4_info(&packet) {
+            let proto_name = protocol_name(proto);
+            if !state.check_outbound_acl(&peer_key, dst_port, proto_name).await {
+                trace!(%dest_ip, dst_port, proto_name, "outbound ACL denied, dropping");
+                continue;
+            }
+        }
 
         // Encrypt the packet
         let counter = nonce_counters
@@ -226,6 +269,15 @@ async fn handle_data_packet(
                         .any(|net| net.contains(&src_ip));
                     if !allowed {
                         warn!(%src_ip, "packet source IP not in allowed_ips, dropping");
+                        return;
+                    }
+                }
+
+                // Inbound ACL check: only for TCP/UDP, ICMP passes through
+                if let Some((proto, _src_port, dst_port)) = extract_l4_info(&plaintext) {
+                    let proto_name = protocol_name(proto);
+                    if !state.check_inbound_acl(src_ip, dst_port, proto_name).await {
+                        trace!(%src_ip, dst_port, proto_name, "inbound ACL denied, dropping");
                         return;
                     }
                 }

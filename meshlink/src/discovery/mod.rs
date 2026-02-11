@@ -265,6 +265,7 @@ pub async fn server_heartbeat_task(
                                                 last_handshake: None,
                                                 tx_bytes: 0,
                                                 rx_bytes: 0,
+                                                acl_rules: Vec::new(),
                                             };
                                             state.add_peer(peer_info).await;
                                             info!(vip = %virtual_ip, "added new peer from server config");

@@ -1,11 +1,13 @@
-use crate::db::NodeRecord;
+use crate::db::{AclEntry, NodeRecord};
 use base64::Engine;
 
-/// Generate a TOML config string for a node, including its identity and all active peers.
+/// Generate a TOML config string for a node, including its identity, all active peers, and ACL rules.
 pub fn generate_config(
     node: &NodeRecord,
     peers: &[NodeRecord],
     coord_server: &str,
+    outbound_acl: &[AclEntry],
+    inbound_acl: &[AclEntry],
 ) -> String {
     let private_key_b64 = base64::engine::general_purpose::STANDARD.encode(&node.private_key_encrypted);
     let virtual_ip = &node.virtual_ip;
@@ -44,6 +46,40 @@ allowed_ips = ["{peer_ip}/32"]
         }
     }
 
+    // Emit outbound ACL rules
+    for entry in outbound_acl {
+        let ip = entry.peer_virtual_ip.split('/').next().unwrap_or(&entry.peer_virtual_ip);
+        config.push_str(&format!(
+            r#"
+[[acl]]
+peer_ip = "{ip}"
+port = {port}
+protocol = "{protocol}"
+action = "{action}"
+"#,
+            port = entry.port,
+            protocol = entry.protocol,
+            action = entry.action,
+        ));
+    }
+
+    // Emit inbound ACL rules
+    for entry in inbound_acl {
+        let ip = entry.peer_virtual_ip.split('/').next().unwrap_or(&entry.peer_virtual_ip);
+        config.push_str(&format!(
+            r#"
+[[inbound_acl]]
+peer_ip = "{ip}"
+port = {port}
+protocol = "{protocol}"
+action = "{action}"
+"#,
+            port = entry.port,
+            protocol = entry.protocol,
+            action = entry.action,
+        ));
+    }
+
     config
 }
 
@@ -74,7 +110,7 @@ mod tests {
         let node = make_node("node1", "10.0.0.1/24", &[1u8; 32], &[2u8; 32]);
         let peer = make_node("node2", "10.0.0.2/24", &[3u8; 32], &[4u8; 32]);
 
-        let config = generate_config(&node, &[node.clone(), peer.clone()], "coord.example.com:4000");
+        let config = generate_config(&node, &[node.clone(), peer.clone()], "coord.example.com:4000", &[], &[]);
 
         assert!(config.contains("[node]"));
         assert!(config.contains("private_key ="));
@@ -93,7 +129,7 @@ mod tests {
         let mut peer = make_node("node2", "10.0.0.2/24", &[3u8; 32], &[4u8; 32]);
         peer.endpoint = Some("1.2.3.4:51820".to_string());
 
-        let config = generate_config(&node, &[peer], "coord.example.com:4000");
+        let config = generate_config(&node, &[peer], "coord.example.com:4000", &[], &[]);
 
         assert!(config.contains("endpoint = \"1.2.3.4:51820\""));
     }
@@ -103,12 +139,44 @@ mod tests {
         let node = make_node("node1", "10.0.0.1/24", &[1u8; 32], &[2u8; 32]);
         let peer = make_node("node2", "10.0.0.2/24", &[3u8; 32], &[4u8; 32]);
 
-        let config = generate_config(&node, &[peer], "coord.example.com:4000");
+        let config = generate_config(&node, &[peer], "coord.example.com:4000", &[], &[]);
 
         // Verify it parses as valid TOML
         let parsed: toml::Value = toml::from_str(&config).expect("config should be valid TOML");
         assert!(parsed.get("node").is_some());
         assert!(parsed.get("coordination").is_some());
         assert!(parsed.get("peers").is_some());
+    }
+
+    #[test]
+    fn test_generate_config_with_acl() {
+        let node = make_node("node1", "10.0.0.1/24", &[1u8; 32], &[2u8; 32]);
+        let peer = make_node("node2", "10.0.0.2/24", &[3u8; 32], &[4u8; 32]);
+
+        let outbound = vec![AclEntry {
+            peer_virtual_ip: "10.0.0.2/24".into(),
+            port: 25565,
+            protocol: "tcp".into(),
+            action: "allow".into(),
+        }];
+        let inbound = vec![AclEntry {
+            peer_virtual_ip: "10.0.0.2/24".into(),
+            port: 25565,
+            protocol: "tcp".into(),
+            action: "allow".into(),
+        }];
+
+        let config = generate_config(&node, &[peer], "coord.example.com:4000", &outbound, &inbound);
+
+        assert!(config.contains("[[acl]]"));
+        assert!(config.contains("[[inbound_acl]]"));
+        assert!(config.contains("port = 25565"));
+        assert!(config.contains("protocol = \"tcp\""));
+        assert!(config.contains("action = \"allow\""));
+
+        // Verify valid TOML
+        let parsed: toml::Value = toml::from_str(&config).expect("config with ACL should be valid TOML");
+        assert!(parsed.get("acl").is_some());
+        assert!(parsed.get("inbound_acl").is_some());
     }
 }
