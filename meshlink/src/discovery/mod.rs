@@ -1,12 +1,13 @@
 use crate::api_client::ApiClient;
 use crate::crypto::handshake::Identity;
 use crate::net::hole_punch;
-use crate::state::SharedState;
+use crate::state::{RoutedPacket, SharedState};
 use anyhow::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::time::{interval, Duration};
+use tokio::sync::mpsc;
+use tokio::time::{interval, timeout, Duration};
 use tracing::{debug, error, info, warn};
 
 /// Protocol message types for coordination server communication.
@@ -25,6 +26,7 @@ mod proto {
 #[derive(Debug, Clone)]
 pub struct DiscoveredPeer {
     pub public_key: [u8; 32],
+    pub virtual_ip: std::net::Ipv4Addr,
     pub endpoint: SocketAddr,
 }
 
@@ -67,14 +69,18 @@ fn parse_peer_list(data: &[u8]) -> Result<Vec<DiscoveredPeer>> {
     let mut peers = Vec::with_capacity(count);
     let mut offset = 3;
     for _ in 0..count {
-        if offset + 33 > data.len() {
+        // pub_key(32) + virtual_ip(4) + addr_type(1) = 37 bytes minimum
+        if offset + 37 > data.len() {
             anyhow::bail!("peer list truncated at entry header");
         }
 
         let mut public_key = [0u8; 32];
         public_key.copy_from_slice(&data[offset..offset + 32]);
-        let addr_type = data[offset + 32];
-        offset += 33;
+        let virtual_ip = std::net::Ipv4Addr::new(
+            data[offset + 32], data[offset + 33], data[offset + 34], data[offset + 35],
+        );
+        let addr_type = data[offset + 36];
+        offset += 37;
 
         let endpoint = match addr_type {
             0x04 => {
@@ -106,6 +112,7 @@ fn parse_peer_list(data: &[u8]) -> Result<Vec<DiscoveredPeer>> {
 
         peers.push(DiscoveredPeer {
             public_key,
+            virtual_ip,
             endpoint,
         });
     }
@@ -119,12 +126,17 @@ fn parse_peer_list(data: &[u8]) -> Result<Vec<DiscoveredPeer>> {
 /// 2. Periodically request peer list
 /// 3. For new peers, attempt hole punching then handshake
 /// 4. Send keepalives to maintain our registration
+///
+/// Coord protocol responses (0x11 NAT, 0x32 peer list) arrive via `coord_rx`,
+/// dispatched by `udp_reader_task`. This task only *sends* on the socket.
 pub async fn discovery_task(
     state: SharedState,
     identity: Arc<Identity>,
     socket: Arc<UdpSocket>,
     coord_addr: SocketAddr,
     listen_port: u16,
+    config_path: std::path::PathBuf,
+    mut coord_rx: mpsc::Receiver<RoutedPacket>,
 ) {
     let our_pub_key = identity.public_key_bytes();
 
@@ -136,8 +148,8 @@ pub async fn discovery_task(
     }
     info!(%coord_addr, "registered with coordination server");
 
-    // NAT detection
-    match hole_punch::detect_nat(&socket, &coord_addr).await {
+    // NAT detection (response comes through coord_rx)
+    match hole_punch::detect_nat(&socket, &coord_addr, &mut coord_rx).await {
         Ok(detection) => {
             info!(?detection, "NAT detection result");
         }
@@ -159,11 +171,10 @@ pub async fn discovery_task(
                     continue;
                 }
 
-                // Receive response (with timeout)
-                let mut buf = vec![0u8; 4096];
-                match tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buf)).await {
-                    Ok(Ok((n, src))) if src == coord_addr && n > 0 && buf[0] == proto::PEER_LIST_RESP => {
-                        match parse_peer_list(&buf[..n]) {
+                // Wait for peer list response on the coord channel
+                match timeout(Duration::from_secs(5), recv_peer_list(&mut coord_rx)).await {
+                    Ok(Some(data)) => {
+                        match parse_peer_list(&data) {
                             Ok(peers) => {
                                 debug!(count = peers.len(), "received peer list");
                                 for discovered in peers {
@@ -175,6 +186,7 @@ pub async fn discovery_task(
                                         &identity,
                                         &socket,
                                         &discovered,
+                                        &config_path,
                                     ).await;
                                 }
                             }
@@ -183,11 +195,8 @@ pub async fn discovery_task(
                             }
                         }
                     }
-                    Ok(Ok(_)) => {
-                        debug!("received non-peer-list response from coord server");
-                    }
-                    Ok(Err(e)) => {
-                        warn!(error = %e, "UDP recv error during discovery");
+                    Ok(None) => {
+                        debug!("coord channel closed");
                     }
                     Err(_) => {
                         debug!("peer list request timed out");
@@ -202,6 +211,19 @@ pub async fn discovery_task(
             }
         }
     }
+}
+
+/// Read from the coord channel until we get a peer list response (0x32).
+/// Returns the raw packet data, or None if the channel closed.
+async fn recv_peer_list(coord_rx: &mut mpsc::Receiver<RoutedPacket>) -> Option<Vec<u8>> {
+    while let Some(pkt) = coord_rx.recv().await {
+        if !pkt.data.is_empty() && pkt.data[0] == 0x32 {
+            return Some(pkt.data);
+        }
+        // Not a peer list response — discard (could be a late NAT response)
+        debug!(msg_type = format!("0x{:02x}", pkt.data.first().copied().unwrap_or(0)), "discarding non-peer-list coord packet");
+    }
+    None
 }
 
 /// Task: periodic heartbeat to the coordination server's REST API.
@@ -292,21 +314,66 @@ pub async fn server_heartbeat_task(
     }
 }
 
-/// Process a newly discovered peer: update state and hole punch for NAT traversal.
+/// Process a newly discovered peer: update state, add if new, and hole punch for NAT traversal.
 async fn process_discovered_peer(
     state: &SharedState,
     identity: &Identity,
     socket: &Arc<UdpSocket>,
     discovered: &DiscoveredPeer,
+    config_path: &std::path::Path,
 ) {
-    // Update endpoint if peer is already known
-    state
-        .set_peer_endpoint(&discovered.public_key, discovered.endpoint)
-        .await;
+    // Skip peers with real IPv6 endpoints — our socket is dual-stack but the
+    // peer may be unreachable if we have no IPv6 route. IPv4-mapped addresses
+    // are already normalized by udp_reader / coord server, so any remaining V6
+    // here is genuinely IPv6-only.
+    if discovered.endpoint.is_ipv6() {
+        debug!(
+            endpoint = %discovered.endpoint,
+            vip = %discovered.virtual_ip,
+            "skipping peer with IPv6 endpoint"
+        );
+        return;
+    }
 
-    let peer = state.get_peer(&discovered.public_key).await;
-    if peer.is_none() {
-        debug!(endpoint = %discovered.endpoint, "discovered unknown peer, skipping (not in config)");
+    let existing = state.get_peer(&discovered.public_key).await;
+
+    if let Some(_) = existing {
+        // Peer already known — just update endpoint
+        state
+            .set_peer_endpoint(&discovered.public_key, discovered.endpoint)
+            .await;
+    } else if !discovered.virtual_ip.is_unspecified() {
+        // New peer with a valid virtual IP — add to state and config
+        let allowed_ip: ipnet::Ipv4Net = format!("{}/32", discovered.virtual_ip)
+            .parse()
+            .expect("valid /32 net");
+
+        let peer_info = crate::state::PeerInfo {
+            public_key: discovered.public_key,
+            endpoint: Some(discovered.endpoint),
+            virtual_ip: discovered.virtual_ip,
+            allowed_ips: vec![allowed_ip],
+            tx_bytes: 0,
+            rx_bytes: 0,
+            acl_rules: Vec::new(),
+        };
+        state.add_peer(peer_info).await;
+
+        let pub_key_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            discovered.public_key,
+        );
+        info!(
+            vip = %discovered.virtual_ip,
+            endpoint = %discovered.endpoint,
+            public_key = %pub_key_b64,
+            "added new discovered peer"
+        );
+
+        // Append peer to config file
+        append_peer_to_config(config_path, &pub_key_b64, discovered.virtual_ip, discovered.endpoint);
+    } else {
+        debug!(endpoint = %discovered.endpoint, "discovered peer has no virtual IP, skipping");
         return;
     }
 
@@ -319,5 +386,36 @@ async fn process_discovered_peer(
     .await
     {
         warn!(error = %e, "hole punch failed");
+    }
+}
+
+/// Append a new peer entry to the config TOML file.
+fn append_peer_to_config(
+    config_path: &std::path::Path,
+    public_key_b64: &str,
+    virtual_ip: std::net::Ipv4Addr,
+    endpoint: SocketAddr,
+) {
+    let peer_block = format!(
+        r#"
+[[peers]]
+public_key = "{public_key_b64}"
+allowed_ips = ["{virtual_ip}/32"]
+endpoint = "{endpoint}"
+"#,
+    );
+
+    match std::fs::OpenOptions::new().append(true).open(config_path) {
+        Ok(mut file) => {
+            use std::io::Write;
+            if let Err(e) = file.write_all(peer_block.as_bytes()) {
+                warn!(error = %e, "failed to append peer to config file");
+            } else {
+                info!(path = %config_path.display(), "appended new peer to config file");
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, path = %config_path.display(), "failed to open config file for appending");
+        }
     }
 }

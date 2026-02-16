@@ -1,10 +1,25 @@
 use crate::state::RoutedPacket;
 use anyhow::Result;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, trace};
+
+/// Convert IPv4-mapped IPv6 addresses (::ffff:x.x.x.x) to plain IPv4.
+/// Leaves everything else unchanged.
+pub fn normalize_addr(addr: SocketAddr) -> SocketAddr {
+    match addr.ip() {
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                SocketAddr::new(IpAddr::V4(v4), addr.port())
+            } else {
+                addr
+            }
+        }
+        _ => addr,
+    }
+}
 
 /// Bind a UDP socket, trying ports from `listen_port` up to `listen_port + 10`.
 /// Returns the socket and the port it actually bound to.
@@ -31,26 +46,62 @@ pub async fn bind_udp(listen_port: u16) -> Result<(UdpSocket, u16)> {
     )
 }
 
-/// Task: read datagrams from UDP socket, forward to inbound pipeline with source address.
-pub async fn udp_reader_task(socket: Arc<UdpSocket>, tx: mpsc::Sender<RoutedPacket>) {
-    let mut buf = vec![0u8; 2048]; // Larger than MTU to handle any overhead
+/// Task: read datagrams from UDP socket, dispatch by packet type.
+///
+/// - `0x04` (data packets) → `data_tx` (to inbound router)
+/// - `0x11`, `0x32` (coord protocol responses) → `coord_tx` (to discovery task)
+/// - everything else → log and drop
+pub async fn udp_reader_task(
+    socket: Arc<UdpSocket>,
+    data_tx: mpsc::Sender<RoutedPacket>,
+    coord_tx: mpsc::Sender<RoutedPacket>,
+) {
+    let mut buf = vec![0u8; 4096];
 
     loop {
         match socket.recv_from(&mut buf).await {
-            Ok((n, src_addr)) => {
-                debug!(bytes = n, %src_addr, "UDP recv");
-                let packet = RoutedPacket {
-                    data: buf[..n].to_vec(),
-                    peer_endpoint: src_addr,
-                };
-                if tx.send(packet).await.is_err() {
-                    info!("UDP reader channel closed, shutting down");
-                    break;
+            Ok((n, raw_src)) => {
+                if n == 0 {
+                    continue;
+                }
+                let src_addr = normalize_addr(raw_src);
+                let first = buf[0];
+
+                match first {
+                    // Data packet
+                    0x04 => {
+                        debug!(bytes = n, %src_addr, "UDP recv data");
+                        let packet = RoutedPacket {
+                            data: buf[..n].to_vec(),
+                            peer_endpoint: src_addr,
+                        };
+                        if data_tx.send(packet).await.is_err() {
+                            info!("UDP reader data channel closed, shutting down");
+                            break;
+                        }
+                    }
+                    // Coord protocol responses: NAT detect resp (0x11), peer list resp (0x32)
+                    0x11 | 0x32 => {
+                        debug!(bytes = n, %src_addr, msg_type = format!("0x{:02x}", first), "UDP recv coord");
+                        let packet = RoutedPacket {
+                            data: buf[..n].to_vec(),
+                            peer_endpoint: src_addr,
+                        };
+                        if coord_tx.send(packet).await.is_err() {
+                            debug!("coord channel closed, dropping coord packet");
+                        }
+                    }
+                    // Hole punch probe — log and drop
+                    0x20 => {
+                        debug!(bytes = n, %src_addr, "hole punch probe received, dropping");
+                    }
+                    _ => {
+                        trace!(bytes = n, %src_addr, msg_type = format!("0x{:02x}", first), "unknown packet type, dropping");
+                    }
                 }
             }
             Err(e) => {
                 error!(error = %e, "UDP recv error");
-                // Transient errors are common with UDP, continue
                 continue;
             }
         }

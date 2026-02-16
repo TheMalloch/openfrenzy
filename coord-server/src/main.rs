@@ -7,10 +7,24 @@ mod key_manager;
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
+
+/// Convert IPv4-mapped IPv6 addresses (::ffff:x.x.x.x) to plain IPv4.
+fn normalize_addr(addr: SocketAddr) -> SocketAddr {
+    match addr.ip() {
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                SocketAddr::new(IpAddr::V4(v4), addr.port())
+            } else {
+                addr
+            }
+        }
+        _ => addr,
+    }
+}
 
 /// A registered peer on the coordination server (in-memory UDP registry).
 #[derive(Debug, Clone)]
@@ -19,6 +33,8 @@ struct RegisteredPeer {
     endpoint: SocketAddr,
     listen_port: u16,
     last_seen: Instant,
+    /// Virtual IP from the database (e.g. 10.0.0.2). None if not yet resolved.
+    virtual_ip: Option<std::net::Ipv4Addr>,
 }
 
 /// Protocol constants (must match meshlink client).
@@ -247,6 +263,7 @@ setInterval(draw,50);
                         if n == 0 {
                             continue;
                         }
+                        let src = normalize_addr(src);
                         handle_message(&socket, &mut peers, &database, &buf[..n], src).await;
                     }
                     Err(e) => {
@@ -290,7 +307,7 @@ async fn handle_message(
             handle_register(peers, database, data, src).await;
         }
         proto::PEER_LIST_REQ => {
-            handle_peer_list_req(socket, peers, data, src).await;
+            handle_peer_list_req(socket, peers, database, data, src).await;
         }
         proto::KEEPALIVE => {
             handle_keepalive(peers, database, data, src).await;
@@ -334,6 +351,15 @@ async fn handle_register(peers: &mut HashMap<[u8; 32], RegisteredPeer>, database
 
     let is_new = !peers.contains_key(&public_key);
 
+    // Look up virtual_ip from database for this public key
+    let virtual_ip = match database.get_node_by_pubkey(&public_key).await {
+        Ok(Some(node)) => {
+            let ip_str = node.virtual_ip.split('/').next().unwrap_or(&node.virtual_ip);
+            ip_str.parse::<std::net::Ipv4Addr>().ok()
+        }
+        _ => None,
+    };
+
     peers.insert(
         public_key,
         RegisteredPeer {
@@ -341,6 +367,7 @@ async fn handle_register(peers: &mut HashMap<[u8; 32], RegisteredPeer>, database
             endpoint: src,
             listen_port,
             last_seen: Instant::now(),
+            virtual_ip,
         },
     );
 
@@ -369,6 +396,7 @@ async fn handle_register(peers: &mut HashMap<[u8; 32], RegisteredPeer>, database
 async fn handle_peer_list_req(
     socket: &UdpSocket,
     peers: &HashMap<[u8; 32], RegisteredPeer>,
+    database: &db::Db,
     data: &[u8],
     src: SocketAddr,
 ) {
@@ -380,31 +408,68 @@ async fn handle_peer_list_req(
     let mut requester_key = [0u8; 32];
     requester_key.copy_from_slice(&data[1..33]);
 
-    let other_peers: Vec<&RegisteredPeer> = peers
-        .values()
-        .filter(|p| p.public_key != requester_key)
+    // Query ALL active nodes from DB (not just UDP-registered ones)
+    let db_nodes = match database.list_active_nodes().await {
+        Ok(nodes) => nodes,
+        Err(e) => {
+            warn!(error = %e, "failed to query nodes from database for peer list");
+            return;
+        }
+    };
+
+    // Filter out the requester
+    let other_nodes: Vec<&db::NodeRecord> = db_nodes
+        .iter()
+        .filter(|n| n.public_key.as_slice() != requester_key.as_slice())
         .collect();
 
-    let count = other_peers.len().min(u16::MAX as usize);
-    // Variable-size entries: pub_key(32) + type(1) + ip(4 or 16) + port(2)
-    let mut resp = Vec::with_capacity(3 + count * (32 + 1 + 16 + 2));
+    let count = other_nodes.len().min(u16::MAX as usize);
+    let mut resp = Vec::with_capacity(3 + count * (32 + 4 + 1 + 16 + 2));
 
     resp.push(proto::PEER_LIST_RESP);
     resp.extend_from_slice(&(count as u16).to_be_bytes());
 
-    for peer in other_peers.iter().take(count) {
-        resp.extend_from_slice(&peer.public_key);
-        match peer.endpoint.ip() {
-            std::net::IpAddr::V4(ip) => {
-                resp.push(0x04);
-                resp.extend_from_slice(&ip.octets());
-            }
-            std::net::IpAddr::V6(ip) => {
-                resp.push(0x06);
-                resp.extend_from_slice(&ip.octets());
-            }
+    for node in other_nodes.iter().take(count) {
+        // Public key (32 bytes)
+        if node.public_key.len() != 32 {
+            continue;
         }
-        resp.extend_from_slice(&peer.endpoint.port().to_be_bytes());
+        resp.extend_from_slice(&node.public_key);
+
+        // Virtual IP (4 bytes)
+        let ip_str = node.virtual_ip.split('/').next().unwrap_or(&node.virtual_ip);
+        let vip: std::net::Ipv4Addr = ip_str.parse().unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
+        resp.extend_from_slice(&vip.octets());
+
+        // Endpoint: prefer live UDP endpoint, fall back to DB endpoint
+        let mut pub_key = [0u8; 32];
+        pub_key.copy_from_slice(&node.public_key);
+        let endpoint: Option<SocketAddr> = peers
+            .get(&pub_key)
+            .map(|p| p.endpoint)
+            .or_else(|| {
+                node.endpoint.as_ref().and_then(|ep| ep.parse().ok())
+            })
+            .map(normalize_addr);
+
+        if let Some(ep) = endpoint {
+            match ep.ip() {
+                std::net::IpAddr::V4(ip) => {
+                    resp.push(0x04);
+                    resp.extend_from_slice(&ip.octets());
+                }
+                std::net::IpAddr::V6(ip) => {
+                    resp.push(0x06);
+                    resp.extend_from_slice(&ip.octets());
+                }
+            }
+            resp.extend_from_slice(&ep.port().to_be_bytes());
+        } else {
+            // No endpoint known — use IPv4 0.0.0.0:0
+            resp.push(0x04);
+            resp.extend_from_slice(&[0, 0, 0, 0]);
+            resp.extend_from_slice(&0u16.to_be_bytes());
+        }
     }
 
     debug!(%src, count, "sending peer list");
@@ -427,6 +492,13 @@ async fn handle_keepalive(peers: &mut HashMap<[u8; 32], RegisteredPeer>, databas
         debug!(%src, "keepalive received");
     } else {
         // After server restart, in-memory map is empty. Re-register the peer.
+        let virtual_ip = match database.get_node_by_pubkey(&public_key).await {
+            Ok(Some(node)) => {
+                let ip_str = node.virtual_ip.split('/').next().unwrap_or(&node.virtual_ip);
+                ip_str.parse::<std::net::Ipv4Addr>().ok()
+            }
+            _ => None,
+        };
         peers.insert(
             public_key,
             RegisteredPeer {
@@ -434,6 +506,7 @@ async fn handle_keepalive(peers: &mut HashMap<[u8; 32], RegisteredPeer>, databas
                 endpoint: src,
                 listen_port: src.port(),
                 last_seen: Instant::now(),
+                virtual_ip,
             },
         );
         info!(%src, "re-registered peer from keepalive");

@@ -1,4 +1,5 @@
 use crate::crypto::transport;
+use crate::net::udp::normalize_addr;
 use crate::state::{RoutedPacket, SharedState};
 use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
@@ -167,6 +168,9 @@ async fn handle_data_packet(
             return;
         }
     };
+
+    // Normalize src in case it's an IPv4-mapped IPv6 address (::ffff:x.x.x.x)
+    let src = normalize_addr(src);
 
     // Find which peer sent this based on the source endpoint
     let peer_key = {

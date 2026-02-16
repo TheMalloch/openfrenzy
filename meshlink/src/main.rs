@@ -243,6 +243,9 @@ async fn run_daemon(
     // Create pipeline channels
     let channels = state::PipelineChannels::new(256);
 
+    // Create coord protocol channel (for NAT detection + peer list responses)
+    let (coord_tx, coord_rx) = tokio::sync::mpsc::channel::<state::RoutedPacket>(64);
+
     // Parse coordination server address (prefer IPv6 for dual-stack, fall back to IPv4)
     let coord_addr: std::net::SocketAddr = tokio::net::lookup_host(&config.coordination.server)
         .await
@@ -260,6 +263,7 @@ async fn run_daemon(
     let udp_reader = tokio::spawn(net::udp::udp_reader_task(
         udp_socket.clone(),
         channels.udp_to_router_tx,
+        coord_tx,
     ));
 
     let udp_writer = tokio::spawn(net::udp::udp_writer_task(
@@ -285,6 +289,8 @@ async fn run_daemon(
         udp_socket.clone(),
         coord_addr,
         actual_port,
+        config_path.to_path_buf(),
+        coord_rx,
     ));
 
     let cli_listener = tokio::spawn(cli::cli_listener_task(shared_state.clone()));

@@ -1,7 +1,9 @@
+use crate::state::RoutedPacket;
 use anyhow::{Context, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
 use tracing::{debug, info, warn};
 
@@ -29,11 +31,12 @@ pub struct NatDetection {
 
 /// Detect our NAT type by querying the coordination server.
 ///
-/// Sends a STUN-like probe: the server echoes back our observed endpoint.
-/// If the observed endpoint matches our local socket, we're not behind NAT.
+/// Sends a STUN-like probe via the socket, then reads the response from the
+/// coord channel (populated by `udp_reader_task`'s dispatch).
 pub async fn detect_nat(
     socket: &Arc<UdpSocket>,
     coord_server: &SocketAddr,
+    coord_rx: &mut mpsc::Receiver<RoutedPacket>,
 ) -> Result<NatDetection> {
     // Send probe packet: [0x10] = NAT detection request
     let probe = [0x10u8];
@@ -42,20 +45,21 @@ pub async fn detect_nat(
         .await
         .context("sending NAT probe")?;
 
-    // Wait for response: [0x11][type: 1][ip: 4|16][port: 2]
-    let mut buf = [0u8; 32];
+    // Wait for the 0x11 response on the coord channel
     let result = timeout(Duration::from_secs(5), async {
-        loop {
-            let (n, src) = socket.recv_from(&mut buf).await?;
-            if src == *coord_server && n >= 8 && buf[0] == 0x11 {
-                return Ok::<_, anyhow::Error>(n);
+        while let Some(pkt) = coord_rx.recv().await {
+            if !pkt.data.is_empty() && pkt.data[0] == 0x11 && pkt.data.len() >= 8 {
+                return Ok::<_, anyhow::Error>(pkt.data);
             }
+            // Not a NAT response — ignore (could be a stale peer list)
         }
+        anyhow::bail!("coord channel closed during NAT detection")
     })
     .await;
 
     match result {
-        Ok(Ok(n)) if n >= 8 => {
+        Ok(Ok(buf)) => {
+            let n = buf.len();
             let public_endpoint = match buf[1] {
                 0x04 if n >= 8 => {
                     let ip = std::net::Ipv4Addr::new(buf[2], buf[3], buf[4], buf[5]);

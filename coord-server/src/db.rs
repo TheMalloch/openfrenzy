@@ -160,6 +160,16 @@ impl Db {
         Ok(node)
     }
 
+    /// Get a node by its public key.
+    pub async fn get_node_by_pubkey(&self, public_key: &[u8]) -> Result<Option<NodeRecord>> {
+        let node = sqlx::query_as::<_, NodeRecord>("SELECT * FROM nodes WHERE public_key = $1")
+            .bind(public_key)
+            .fetch_optional(&self.pool)
+            .await
+            .context("fetching node by pubkey")?;
+        Ok(node)
+    }
+
     /// Update a node's status.
     pub async fn update_node_status(&self, node_id: &str, status: &str) -> Result<()> {
         sqlx::query("UPDATE nodes SET status = $1, updated_at = NOW() WHERE node_id = $2")
