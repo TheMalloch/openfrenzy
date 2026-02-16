@@ -1,5 +1,5 @@
 use crate::api_client::ApiClient;
-use crate::crypto::handshake::{self, Identity};
+use crate::crypto::handshake::Identity;
 use crate::net::hole_punch;
 use crate::state::SharedState;
 use anyhow::Result;
@@ -125,7 +125,6 @@ pub async fn discovery_task(
     socket: Arc<UdpSocket>,
     coord_addr: SocketAddr,
     listen_port: u16,
-    udp_tx: tokio::sync::mpsc::Sender<crate::state::RoutedPacket>,
 ) {
     let our_pub_key = identity.public_key_bytes();
 
@@ -176,7 +175,6 @@ pub async fn discovery_task(
                                         &identity,
                                         &socket,
                                         &discovered,
-                                        &udp_tx,
                                     ).await;
                                 }
                             }
@@ -261,8 +259,6 @@ pub async fn server_heartbeat_task(
                                                 endpoint: peer_config.endpoint,
                                                 virtual_ip,
                                                 allowed_ips: peer_config.allowed_ips.clone(),
-                                                session_key: None,
-                                                last_handshake: None,
                                                 tx_bytes: 0,
                                                 rx_bytes: 0,
                                                 acl_rules: Vec::new(),
@@ -296,13 +292,12 @@ pub async fn server_heartbeat_task(
     }
 }
 
-/// Process a newly discovered peer: update state, hole punch, initiate handshake.
+/// Process a newly discovered peer: update state and hole punch for NAT traversal.
 async fn process_discovered_peer(
     state: &SharedState,
     identity: &Identity,
     socket: &Arc<UdpSocket>,
     discovered: &DiscoveredPeer,
-    udp_tx: &tokio::sync::mpsc::Sender<crate::state::RoutedPacket>,
 ) {
     // Update endpoint if peer is already known
     state
@@ -310,47 +305,19 @@ async fn process_discovered_peer(
         .await;
 
     let peer = state.get_peer(&discovered.public_key).await;
+    if peer.is_none() {
+        debug!(endpoint = %discovered.endpoint, "discovered unknown peer, skipping (not in config)");
+        return;
+    }
 
-    // If no session key, initiate handshake
-    let needs_handshake = match &peer {
-        Some(p) => p.session_key.is_none(),
-        None => {
-            debug!(endpoint = %discovered.endpoint, "discovered unknown peer, skipping (not in config)");
-            return;
-        }
-    };
-
-    if needs_handshake {
-        info!(endpoint = %discovered.endpoint, "initiating handshake with peer");
-
-        // Attempt hole punch first
-        if let Err(e) = hole_punch::punch_hole(
-            socket,
-            discovered.endpoint,
-            &identity.public_key_bytes(),
-        )
-        .await
-        {
-            warn!(error = %e, "hole punch failed");
-        }
-
-        // Send handshake initiation
-        let hs = handshake::initiate_handshake(&discovered.public_key);
-        let msg = handshake::build_handshake_init(
-            &identity.public_key_bytes(),
-            &hs.ephemeral_public,
-        );
-
-        let _ = udp_tx
-            .send(crate::state::RoutedPacket {
-                data: msg,
-                peer_endpoint: discovered.endpoint,
-            })
-            .await;
-
-        // Store the session key from our side
-        state
-            .set_session_key(&discovered.public_key, hs.session_key)
-            .await;
+    // Attempt hole punch for NAT traversal
+    if let Err(e) = hole_punch::punch_hole(
+        socket,
+        discovered.endpoint,
+        &identity.public_key_bytes(),
+    )
+    .await
+    {
+        warn!(error = %e, "hole punch failed");
     }
 }

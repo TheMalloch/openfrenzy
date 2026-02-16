@@ -27,7 +27,7 @@ allowed_ips = ["{peer_allowed}"]
     )
 }
 
-// ---- Crypto: key generation and handshake ----
+// ---- Crypto: key generation ----
 
 #[test]
 fn test_keygen_identity() {
@@ -49,209 +49,50 @@ fn test_identity_from_base64_roundtrip() {
     assert_eq!(id.public_key_bytes(), restored.public_key_bytes());
 }
 
-#[test]
-fn test_handshake_shared_secret() {
-    // Simulate: Node A initiates handshake to Node B
-    let node_a = meshlink::crypto::handshake::Identity::generate();
-    let node_b = meshlink::crypto::handshake::Identity::generate();
-
-    // A initiates: uses B's static public key
-    let a_result = meshlink::crypto::handshake::initiate_handshake(&node_b.public_key_bytes());
-
-    // B responds: uses A's ephemeral public key
-    let b_session_key =
-        meshlink::crypto::handshake::respond_handshake(&node_b, &a_result.ephemeral_public);
-
-    // Both should derive the same shared secret
-    assert_eq!(a_result.session_key, b_session_key);
-}
+// ---- Transport: wrap/unwrap ----
 
 #[test]
-fn test_handshake_wire_format() {
-    let id = meshlink::crypto::handshake::Identity::generate();
-    let result = meshlink::crypto::handshake::initiate_handshake(&id.public_key_bytes());
-
-    let msg = meshlink::crypto::handshake::build_handshake_init(
-        &id.public_key_bytes(),
-        &result.ephemeral_public,
-    );
-
-    assert_eq!(msg.len(), meshlink::crypto::handshake::HANDSHAKE_INIT_SIZE);
-    assert_eq!(msg[0], 1); // Initiation type
-
-    // Parse it back
-    let (msg_type, static_pub, ephemeral_pub) =
-        meshlink::crypto::handshake::parse_handshake(&msg).unwrap();
-
-    assert_eq!(
-        msg_type,
-        meshlink::crypto::handshake::HandshakeType::Initiation
-    );
-    assert_eq!(static_pub, id.public_key_bytes());
-    assert_eq!(ephemeral_pub, result.ephemeral_public);
-}
-
-#[test]
-fn test_handshake_response_wire_format() {
-    let id = meshlink::crypto::handshake::Identity::generate();
-    let result = meshlink::crypto::handshake::initiate_handshake(&id.public_key_bytes());
-
-    let msg = meshlink::crypto::handshake::build_handshake_response(
-        &id.public_key_bytes(),
-        &result.ephemeral_public,
-    );
-
-    assert_eq!(msg.len(), meshlink::crypto::handshake::HANDSHAKE_RESP_SIZE);
-    assert_eq!(msg[0], 2); // Response type
-
-    let (msg_type, _, _) = meshlink::crypto::handshake::parse_handshake(&msg).unwrap();
-    assert_eq!(
-        msg_type,
-        meshlink::crypto::handshake::HandshakeType::Response
-    );
-}
-
-#[test]
-fn test_parse_handshake_too_short() {
-    let result = meshlink::crypto::handshake::parse_handshake(&[1, 2, 3]);
-    assert!(result.is_err());
-}
-
-// ---- Crypto: transport encryption ----
-
-#[test]
-fn test_encrypt_decrypt_roundtrip() {
-    let key = [42u8; 32];
+fn test_wrap_unwrap_roundtrip() {
     let plaintext = b"Hello, MeshLink!";
+    let wrapped = meshlink::crypto::transport::wrap_packet(plaintext);
 
-    let encrypted =
-        meshlink::crypto::transport::encrypt_packet(&key, 0, plaintext).unwrap();
+    assert_eq!(wrapped[0], meshlink::crypto::transport::DATA_PACKET_TYPE);
+    assert_eq!(wrapped.len(), 1 + plaintext.len());
 
-    // Should be larger than plaintext (type + nonce + tag)
-    assert!(encrypted.len() > plaintext.len());
-    assert_eq!(encrypted[0], meshlink::crypto::transport::DATA_PACKET_TYPE);
-
-    let decrypted = meshlink::crypto::transport::decrypt_packet(&key, &encrypted).unwrap();
-    assert_eq!(decrypted, plaintext);
+    let unwrapped = meshlink::crypto::transport::unwrap_packet(&wrapped).unwrap();
+    assert_eq!(unwrapped, plaintext);
 }
 
 #[test]
-fn test_encrypt_different_nonces_different_ciphertext() {
-    let key = [42u8; 32];
-    let plaintext = b"same data";
-
-    let enc1 = meshlink::crypto::transport::encrypt_packet(&key, 0, plaintext).unwrap();
-    let enc2 = meshlink::crypto::transport::encrypt_packet(&key, 1, plaintext).unwrap();
-
-    // Different nonces should produce different ciphertext
-    assert_ne!(enc1, enc2);
-
-    // Both should decrypt correctly
-    let dec1 = meshlink::crypto::transport::decrypt_packet(&key, &enc1).unwrap();
-    let dec2 = meshlink::crypto::transport::decrypt_packet(&key, &enc2).unwrap();
-    assert_eq!(dec1, plaintext);
-    assert_eq!(dec2, plaintext);
+fn test_wrap_large_payload() {
+    let payload = vec![0xABu8; 1420];
+    let wrapped = meshlink::crypto::transport::wrap_packet(&payload);
+    let unwrapped = meshlink::crypto::transport::unwrap_packet(&wrapped).unwrap();
+    assert_eq!(unwrapped, &payload[..]);
 }
 
 #[test]
-fn test_decrypt_wrong_key_fails() {
-    let key1 = [42u8; 32];
-    let key2 = [99u8; 32];
-    let plaintext = b"secret message";
-
-    let encrypted = meshlink::crypto::transport::encrypt_packet(&key1, 0, plaintext).unwrap();
-    let result = meshlink::crypto::transport::decrypt_packet(&key2, &encrypted);
-    assert!(result.is_err());
+fn test_unwrap_invalid_type() {
+    // Wrong type byte
+    let result = meshlink::crypto::transport::unwrap_packet(&[0x01, 1, 2, 3]);
+    assert!(result.is_none());
 }
 
 #[test]
-fn test_decrypt_tampered_data_fails() {
-    let key = [42u8; 32];
-    let plaintext = b"important data";
+fn test_unwrap_too_short() {
+    // Just the type byte, no payload
+    let result = meshlink::crypto::transport::unwrap_packet(&[0x04]);
+    assert!(result.is_none());
 
-    let mut encrypted =
-        meshlink::crypto::transport::encrypt_packet(&key, 0, plaintext).unwrap();
-
-    // Tamper with ciphertext
-    let last = encrypted.len() - 1;
-    encrypted[last] ^= 0xFF;
-
-    let result = meshlink::crypto::transport::decrypt_packet(&key, &encrypted);
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_decrypt_too_short_fails() {
-    let key = [42u8; 32];
-    let result = meshlink::crypto::transport::decrypt_packet(&key, &[0x04, 0, 0]);
-    assert!(result.is_err());
+    let result = meshlink::crypto::transport::unwrap_packet(&[]);
+    assert!(result.is_none());
 }
 
 #[test]
 fn test_packet_type_detection() {
     assert!(meshlink::crypto::transport::is_data_packet(&[0x04, 1, 2, 3]));
     assert!(!meshlink::crypto::transport::is_data_packet(&[0x01, 1, 2]));
-    assert!(meshlink::crypto::transport::is_handshake_packet(&[0x01]));
-    assert!(meshlink::crypto::transport::is_handshake_packet(&[0x02]));
-    assert!(!meshlink::crypto::transport::is_handshake_packet(&[0x04]));
     assert!(!meshlink::crypto::transport::is_data_packet(&[]));
-    assert!(!meshlink::crypto::transport::is_handshake_packet(&[]));
-}
-
-#[test]
-fn test_nonce_counter() {
-    let mut counter = meshlink::crypto::transport::NonceCounter::new();
-    assert_eq!(counter.next(), 0);
-    assert_eq!(counter.next(), 1);
-    assert_eq!(counter.next(), 2);
-}
-
-// ---- Full handshake + encrypted tunnel simulation ----
-
-#[test]
-fn test_full_handshake_then_data_exchange() {
-    let node_a = meshlink::crypto::handshake::Identity::generate();
-    let node_b = meshlink::crypto::handshake::Identity::generate();
-
-    // Step 1: A initiates handshake
-    let a_hs = meshlink::crypto::handshake::initiate_handshake(&node_b.public_key_bytes());
-    let init_msg = meshlink::crypto::handshake::build_handshake_init(
-        &node_a.public_key_bytes(),
-        &a_hs.ephemeral_public,
-    );
-
-    // Step 2: B receives initiation, derives session key
-    let (_, _sender_pub, ephemeral_pub) =
-        meshlink::crypto::handshake::parse_handshake(&init_msg).unwrap();
-    let b_session_key =
-        meshlink::crypto::handshake::respond_handshake(&node_b, &ephemeral_pub);
-
-    // Both have same session key
-    let a_session_key = a_hs.session_key;
-    assert_eq!(a_session_key, b_session_key);
-
-    // Step 3: A sends encrypted data to B
-    let payload = b"ping from A";
-    let mut a_counter = meshlink::crypto::transport::NonceCounter::new();
-    let encrypted =
-        meshlink::crypto::transport::encrypt_packet(&a_session_key, a_counter.next(), payload)
-            .unwrap();
-
-    // B decrypts
-    let decrypted =
-        meshlink::crypto::transport::decrypt_packet(&b_session_key, &encrypted).unwrap();
-    assert_eq!(decrypted, payload);
-
-    // Step 4: B sends encrypted data to A
-    let reply = b"pong from B";
-    let mut b_counter = meshlink::crypto::transport::NonceCounter::new();
-    let encrypted =
-        meshlink::crypto::transport::encrypt_packet(&b_session_key, b_counter.next(), reply)
-            .unwrap();
-
-    let decrypted =
-        meshlink::crypto::transport::decrypt_packet(&a_session_key, &encrypted).unwrap();
-    assert_eq!(decrypted, reply);
 }
 
 // ---- Config parsing ----
@@ -320,10 +161,9 @@ async fn test_state_add_peer_and_lookup() {
             endpoint: Some("1.2.3.4:51820".parse().unwrap()),
             virtual_ip,
             allowed_ips: vec!["10.0.0.2/32".parse().unwrap()],
-            session_key: None,
-            last_handshake: None,
             tx_bytes: 0,
             rx_bytes: 0,
+            acl_rules: Vec::new(),
         })
         .await;
 
@@ -337,7 +177,7 @@ async fn test_state_add_peer_and_lookup() {
 }
 
 #[tokio::test]
-async fn test_state_session_key_and_stats() {
+async fn test_state_endpoint_and_stats() {
     let state = meshlink::state::SharedState::new();
 
     let pub_key = [2u8; 32];
@@ -347,23 +187,15 @@ async fn test_state_session_key_and_stats() {
             endpoint: None,
             virtual_ip: "10.0.0.3".parse().unwrap(),
             allowed_ips: vec!["10.0.0.3/32".parse().unwrap()],
-            session_key: None,
-            last_handshake: None,
             tx_bytes: 0,
             rx_bytes: 0,
+            acl_rules: Vec::new(),
         })
         .await;
 
-    // No session key initially
+    // No endpoint initially
     let peer = state.get_peer(&pub_key).await.unwrap();
-    assert!(peer.session_key.is_none());
-
-    // Set session key
-    let session_key = [42u8; 32];
-    state.set_session_key(&pub_key, session_key).await;
-    let peer = state.get_peer(&pub_key).await.unwrap();
-    assert_eq!(peer.session_key, Some(session_key));
-    assert!(peer.last_handshake.is_some());
+    assert!(peer.endpoint.is_none());
 
     // Update endpoint
     let ep: SocketAddr = "5.6.7.8:12345".parse().unwrap();
@@ -417,7 +249,7 @@ async fn test_coord_server_nat_detect() {
     // Spawn mock server that responds to NAT detect
     let server_handle = tokio::spawn(async move {
         let mut buf = [0u8; 64];
-        let (n, src) = server_sock.recv_from(&mut buf).await.unwrap();
+        let (_n, src) = server_sock.recv_from(&mut buf).await.unwrap();
         assert_eq!(buf[0], 0x10); // NAT detect request
 
         // Respond with client's observed address
@@ -439,31 +271,4 @@ async fn test_coord_server_nat_detect() {
     assert_eq!(ep.port(), client_addr.port());
 
     server_handle.await.unwrap();
-}
-
-// ---- Large payload encryption ----
-
-#[test]
-fn test_encrypt_large_payload() {
-    let key = [7u8; 32];
-    // Simulate a full MTU-sized packet
-    let payload = vec![0xABu8; 1420];
-
-    let encrypted =
-        meshlink::crypto::transport::encrypt_packet(&key, 0, &payload).unwrap();
-    let decrypted =
-        meshlink::crypto::transport::decrypt_packet(&key, &encrypted).unwrap();
-    assert_eq!(decrypted, payload);
-}
-
-#[test]
-fn test_encrypt_empty_payload() {
-    let key = [7u8; 32];
-    let payload = b"";
-
-    let encrypted =
-        meshlink::crypto::transport::encrypt_packet(&key, 0, payload).unwrap();
-    let decrypted =
-        meshlink::crypto::transport::decrypt_packet(&key, &encrypted).unwrap();
-    assert_eq!(decrypted, payload);
 }

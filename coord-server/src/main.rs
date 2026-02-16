@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
 
     // Load config from env vars
     let database_url =
-        std::env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://localhost/meshlink".into());
+        std::env::var("DATABASE_URL").unwrap_or_else(|_| "postgres:///meshlink?user=meshlink".into());
     let mesh_network = std::env::var("MESH_NETWORK").unwrap_or_else(|_| "10.0.0.0/24".into());
     let http_port: u16 = std::env::var("HTTP_PORT")
         .unwrap_or_else(|_| "4001".into())

@@ -219,8 +219,6 @@ async fn run_daemon(
             endpoint: peer_config.endpoint,
             virtual_ip,
             allowed_ips: peer_config.allowed_ips.clone(),
-            session_key: None,
-            last_handshake: None,
             tx_bytes: 0,
             rx_bytes: 0,
             acl_rules: peer_acl,
@@ -277,10 +275,8 @@ async fn run_daemon(
 
     let inbound_router = tokio::spawn(router::inbound_router_task(
         shared_state.clone(),
-        identity.clone(),
         channels.udp_to_router_rx,
         channels.router_to_tun_tx,
-        channels.router_to_udp_tx.clone(),
     ));
 
     let discovery = tokio::spawn(discovery::discovery_task(
@@ -289,7 +285,6 @@ async fn run_daemon(
         udp_socket.clone(),
         coord_addr,
         actual_port,
-        channels.router_to_udp_tx,
     ));
 
     let cli_listener = tokio::spawn(cli::cli_listener_task(shared_state.clone()));

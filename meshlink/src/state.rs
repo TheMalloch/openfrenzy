@@ -14,9 +14,6 @@ pub struct PeerInfo {
     pub endpoint: Option<SocketAddr>,
     pub virtual_ip: std::net::Ipv4Addr,
     pub allowed_ips: Vec<ipnet::Ipv4Net>,
-    /// Shared symmetric key derived from handshake (32 bytes for ChaCha20-Poly1305).
-    pub session_key: Option<[u8; 32]>,
-    pub last_handshake: Option<std::time::Instant>,
     pub tx_bytes: u64,
     pub rx_bytes: u64,
     /// Outbound ACL rules for services on this peer.
@@ -79,14 +76,6 @@ impl SharedState {
     pub async fn set_peer_endpoint(&self, key: &PeerPublicKey, endpoint: SocketAddr) {
         if let Some(peer) = self.peers.write().await.get_mut(key) {
             peer.endpoint = Some(endpoint);
-        }
-    }
-
-    /// Store the session key after a successful handshake.
-    pub async fn set_session_key(&self, key: &PeerPublicKey, session_key: [u8; 32]) {
-        if let Some(peer) = self.peers.write().await.get_mut(key) {
-            peer.session_key = Some(session_key);
-            peer.last_handshake = Some(std::time::Instant::now());
         }
     }
 
@@ -158,15 +147,15 @@ pub struct PipelineChannels {
     pub tun_to_router_tx: mpsc::Sender<Vec<u8>>,
     pub tun_to_router_rx: mpsc::Receiver<Vec<u8>>,
 
-    // Router -> crypto encrypt -> UDP writer (outbound encrypted)
+    // Router -> UDP writer (outbound wrapped)
     pub router_to_udp_tx: mpsc::Sender<RoutedPacket>,
     pub router_to_udp_rx: mpsc::Receiver<RoutedPacket>,
 
-    // UDP reader -> crypto decrypt -> router (inbound encrypted)
+    // UDP reader -> router (inbound)
     pub udp_to_router_tx: mpsc::Sender<RoutedPacket>,
     pub udp_to_router_rx: mpsc::Receiver<RoutedPacket>,
 
-    // Router -> TUN writer (inbound decrypted)
+    // Router -> TUN writer (inbound unwrapped)
     pub router_to_tun_tx: mpsc::Sender<Vec<u8>>,
     pub router_to_tun_rx: mpsc::Receiver<Vec<u8>>,
 }

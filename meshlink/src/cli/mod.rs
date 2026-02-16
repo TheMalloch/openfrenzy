@@ -163,7 +163,7 @@ async fn process_command(cmd: &str, state: &SharedState) -> String {
     match cmd {
         "status" => {
             let peers = state.peers.read().await;
-            let connected = peers.values().filter(|p| p.session_key.is_some()).count();
+            let connected = peers.values().filter(|p| p.endpoint.is_some()).count();
             format!(
                 "MeshLink running\nPeers: {} total, {} connected",
                 peers.len(),
@@ -177,7 +177,7 @@ async fn process_command(cmd: &str, state: &SharedState) -> String {
             }
             let mut output = String::from("Peers:\n");
             for peer in peers.values() {
-                let status = if peer.session_key.is_some() {
+                let status = if peer.endpoint.is_some() {
                     "connected"
                 } else {
                     "disconnected"
