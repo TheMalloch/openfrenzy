@@ -372,18 +372,24 @@ async fn handle_register(peers: &mut HashMap<[u8; 32], RegisteredPeer>, database
     );
 
     // Persist endpoint to the database so HTTP config endpoints return it.
-    // Use src directly — it's the NAT-visible IP:port.
-    let endpoint_str = src.to_string();
-    match database.update_endpoint_by_pubkey(&public_key, &endpoint_str).await {
-        Ok(true) => {
-            debug!(%src, %endpoint_str, "persisted endpoint to database");
+    // Skip loopback addresses — they happen when the node and coord server are
+    // on the same machine and are useless for remote peers.
+    let is_loopback = src.ip().is_loopback();
+    if !is_loopback {
+        let endpoint_str = src.to_string();
+        match database.update_endpoint_by_pubkey(&public_key, &endpoint_str).await {
+            Ok(true) => {
+                debug!(%src, %endpoint_str, "persisted endpoint to database");
+            }
+            Ok(false) => {
+                debug!(%src, "UDP register: no matching node in database for this public key");
+            }
+            Err(e) => {
+                warn!(error = %e, %src, "failed to persist endpoint to database");
+            }
         }
-        Ok(false) => {
-            debug!(%src, "UDP register: no matching node in database for this public key");
-        }
-        Err(e) => {
-            warn!(error = %e, %src, "failed to persist endpoint to database");
-        }
+    } else {
+        debug!(%src, "skipping DB endpoint update for loopback address");
     }
 
     if is_new {

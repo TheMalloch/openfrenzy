@@ -246,12 +246,20 @@ async fn run_daemon(
     // Create coord protocol channel (for NAT detection + peer list responses)
     let (coord_tx, coord_rx) = tokio::sync::mpsc::channel::<state::RoutedPacket>(64);
 
-    // Parse coordination server address (prefer IPv6 for dual-stack, fall back to IPv4)
-    let coord_addr: std::net::SocketAddr = tokio::net::lookup_host(&config.coordination.server)
-        .await
-        .context("resolving coordination server")?
-        .next()
-        .context("no addresses for coordination server")?;
+    // Parse coordination server address — prefer IPv4 so the coord server sees our
+    // IPv4 source address (peers without IPv6 can't reach an IPv6-only endpoint).
+    let coord_addr: std::net::SocketAddr = {
+        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&config.coordination.server)
+            .await
+            .context("resolving coordination server")?
+            .collect();
+        addrs
+            .iter()
+            .find(|a| a.is_ipv4())
+            .or(addrs.first())
+            .copied()
+            .context("no addresses for coordination server")?
+    };
 
     info!("spawning async tasks");
 
