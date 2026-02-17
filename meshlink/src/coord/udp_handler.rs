@@ -204,17 +204,22 @@ async fn build_peer_list_response(
             resp.extend_from_slice(&0u16.to_be_bytes());
         }
 
-        // Append LAN IP (4 bytes): prefer in-memory, fall back to DB
-        let lan_ip = peer_map
+        // Append LAN IP (4 bytes) + LAN port (2 bytes): prefer in-memory, fall back to DB
+        let (lan_ip, lan_port) = peer_map
             .get(&pub_key)
-            .and_then(|p| p.lan_ip)
+            .and_then(|p| p.lan_ip.map(|ip| (ip, p.listen_port)))
             .or_else(|| {
                 node.lan_endpoint.as_ref().and_then(|ep| {
-                    // lan_endpoint is stored as "ip:port", extract just the IP
-                    ep.split(':').next().and_then(|s| s.parse::<std::net::Ipv4Addr>().ok())
+                    // lan_endpoint is stored as "ip:port"
+                    let parts: Vec<&str> = ep.splitn(2, ':').collect();
+                    let ip = parts.first()?.parse::<std::net::Ipv4Addr>().ok()?;
+                    let port = parts.get(1).and_then(|p| p.parse::<u16>().ok()).unwrap_or(node.listen_port as u16);
+                    Some((ip, port))
                 })
-            });
-        resp.extend_from_slice(&lan_ip.unwrap_or(std::net::Ipv4Addr::UNSPECIFIED).octets());
+            })
+            .unwrap_or((std::net::Ipv4Addr::UNSPECIFIED, 0));
+        resp.extend_from_slice(&lan_ip.octets());
+        resp.extend_from_slice(&lan_port.to_be_bytes());
     }
 
     resp

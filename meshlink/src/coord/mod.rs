@@ -242,8 +242,9 @@ impl CoordServerConfig {
 
 /// Start the coordination server (UDP + HTTP + stale node checker).
 pub async fn run(config: CoordServerConfig) -> Result<()> {
-    // Connect to PostgreSQL
+    // Connect to PostgreSQL and run migrations
     let database = db::Db::connect(&config.database_url).await?;
+    database.setup_tables().await?;
 
     // Set up IP allocator
     let ip_allocator = ip_allocator::IpAllocator::new(&config.mesh_network)

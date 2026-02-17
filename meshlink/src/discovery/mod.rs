@@ -140,12 +140,13 @@ fn parse_peer_list(data: &[u8]) -> Result<Vec<DiscoveredPeer>> {
             }
         };
 
-        // Read optional LAN IP (4 bytes) appended by new-format servers
-        let lan_endpoint = if offset + 4 <= data.len() {
+        // Read optional LAN IP (4 bytes) + LAN port (2 bytes) appended by new-format servers
+        let lan_endpoint = if offset + 6 <= data.len() {
             let lan_ip = Ipv4Addr::new(data[offset], data[offset + 1], data[offset + 2], data[offset + 3]);
-            offset += 4;
-            if !lan_ip.is_unspecified() {
-                Some(SocketAddr::new(IpAddr::V4(lan_ip), endpoint.port()))
+            let lan_port = u16::from_be_bytes([data[offset + 4], data[offset + 5]]);
+            offset += 6;
+            if !lan_ip.is_unspecified() && lan_port != 0 {
+                Some(SocketAddr::new(IpAddr::V4(lan_ip), lan_port))
             } else {
                 None
             }
