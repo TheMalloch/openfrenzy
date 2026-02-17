@@ -219,7 +219,7 @@ async fn register(
 
     // Insert node
     if let Err(e) = state.db.insert_node(&node_record).await {
-        warn!(error = %e, "failed to insert node");
+        warn!(error = ?e, "failed to insert node");
         return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
     }
 

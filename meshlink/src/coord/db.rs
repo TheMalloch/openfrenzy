@@ -53,8 +53,7 @@ impl Db {
     /// Create all required tables (idempotent).
     pub async fn setup_tables(&self) -> Result<()> {
         sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS nodes (
+            r#"CREATE TABLE IF NOT EXISTS nodes (
                 node_id TEXT PRIMARY KEY,
                 node_name TEXT,
                 public_key BYTEA NOT NULL UNIQUE,
@@ -69,9 +68,14 @@ impl Db {
                 last_heartbeat TIMESTAMPTZ,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
+            )"#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("creating nodes table")?;
 
-            CREATE TABLE IF NOT EXISTS invites (
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS invites (
                 code TEXT PRIMARY KEY,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 expires_at TIMESTAMPTZ NOT NULL,
@@ -79,22 +83,40 @@ impl Db {
                 used_by_node_id TEXT REFERENCES nodes(node_id),
                 max_uses INTEGER NOT NULL DEFAULT 1,
                 use_count INTEGER NOT NULL DEFAULT 0
-            );
-            "#,
+            )"#,
         )
         .execute(&self.pool)
         .await
-        .context("creating tables")?;
+        .context("creating invites table")?;
+
+        // Migrate existing tables: add columns if missing
+        sqlx::query("ALTER TABLE invites ADD COLUMN IF NOT EXISTS max_uses INTEGER NOT NULL DEFAULT 1")
+            .execute(&self.pool)
+            .await
+            .context("migrating invites: max_uses")?;
+        sqlx::query("ALTER TABLE invites ADD COLUMN IF NOT EXISTS use_count INTEGER NOT NULL DEFAULT 0")
+            .execute(&self.pool)
+            .await
+            .context("migrating invites: use_count")?;
+        sqlx::query("ALTER TABLE nodes ADD COLUMN IF NOT EXISTS ipv6_endpoint TEXT")
+            .execute(&self.pool)
+            .await
+            .context("migrating nodes: ipv6_endpoint")?;
+
         info!("database tables created");
         Ok(())
     }
 
     /// Drop all tables (destructive!).
     pub async fn drop_all_tables(&self) -> Result<()> {
-        sqlx::query("DROP TABLE IF EXISTS invites CASCADE; DROP TABLE IF EXISTS nodes CASCADE;")
+        sqlx::query("DROP TABLE IF EXISTS invites CASCADE")
             .execute(&self.pool)
             .await
-            .context("dropping tables")?;
+            .context("dropping invites table")?;
+        sqlx::query("DROP TABLE IF EXISTS nodes CASCADE")
+            .execute(&self.pool)
+            .await
+            .context("dropping nodes table")?;
         info!("all tables dropped");
         Ok(())
     }
