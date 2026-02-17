@@ -50,11 +50,13 @@ pub async fn run_udp_server(
     socket: Arc<UdpSocket>,
     peers: PeerMap,
     database: db::Db,
+    stale_timeout_secs: u64,
+    cleanup_interval_secs: u64,
 ) -> Result<()> {
     info!("UDP coordination server started");
 
     let mut buf = vec![0u8; 4096];
-    let mut cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    let mut cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(cleanup_interval_secs));
 
     loop {
         tokio::select! {
@@ -75,7 +77,7 @@ pub async fn run_udp_server(
             _ = cleanup_interval.tick() => {
                 let mut map = peers.lock().await;
                 let before = map.len();
-                let cutoff = Instant::now() - std::time::Duration::from_secs(120);
+                let cutoff = Instant::now() - std::time::Duration::from_secs(stale_timeout_secs);
                 map.retain(|_, p| p.last_seen > cutoff);
                 let removed = before - map.len();
                 if removed > 0 {
@@ -91,11 +93,13 @@ pub async fn stale_node_checker(
     database: db::Db,
     socket: Arc<UdpSocket>,
     peers: PeerMap,
+    stale_timeout_secs: u64,
+    cleanup_interval_secs: u64,
 ) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(cleanup_interval_secs));
     loop {
         interval.tick().await;
-        match database.mark_stale_nodes(120).await {
+        match database.mark_stale_nodes(stale_timeout_secs as i64).await {
             Ok(count) if count > 0 => {
                 info!(count, "marked stale nodes in database");
                 // Broadcast updated peer list to all connected peers

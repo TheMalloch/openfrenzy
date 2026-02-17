@@ -149,8 +149,8 @@ fn main() -> Result<()> {
                 let resp = cli::send_command("peers").await?;
                 print!("{resp}");
             }
-            Some(Command::Cs { action }) => {
-                return handle_cs_action(action).await;
+            Some(Command::Cs { config, action }) => {
+                return handle_cs_action(config, action).await;
             }
             Some(Command::Up { foreground, .. }) => {
                 run_daemon(&cli.config, coord_server_override, *foreground).await?;
@@ -213,11 +213,50 @@ fn handle_down() -> Result<()> {
 }
 
 /// Handle coordination server subcommands.
-async fn handle_cs_action(action: &cli::CsAction) -> Result<()> {
-    let config = coord::CoordServerConfig::from_env()?;
+async fn handle_cs_action(config_path: &std::path::Path, action: &cli::CsAction) -> Result<()> {
+    let mut config = if config_path.exists() {
+        info!(path = %config_path.display(), "loading coord config from file");
+        coord::CoordServerConfig::load(config_path)?
+    } else {
+        info!("coord config file not found, falling back to environment variables");
+        coord::CoordServerConfig::from_env()?
+    };
 
     match action {
-        cli::CsAction::Start => {
+        cli::CsAction::Start {
+            database_url,
+            mesh_cidr,
+            http_port,
+            udp_port,
+            bind_address,
+            external_address,
+            tls_cert,
+            tls_key,
+            admin_token,
+            stale_timeout_secs,
+            cleanup_interval_secs,
+            max_peers,
+            default_listen_port,
+            default_expiry_hours,
+            default_max_uses,
+            log_level,
+        } => {
+            if let Some(v) = database_url { config.database_url = v.clone(); }
+            if let Some(v) = mesh_cidr { config.mesh_network = v.clone(); }
+            if let Some(v) = http_port { config.http_port = *v; }
+            if let Some(v) = udp_port { config.udp_port = *v; }
+            if let Some(v) = bind_address { config.bind_address = v.clone(); }
+            if let Some(v) = external_address { config.external_address = v.clone(); }
+            if let Some(v) = tls_cert { config.tls_cert = Some(v.clone()); }
+            if let Some(v) = tls_key { config.tls_key = Some(v.clone()); }
+            if let Some(v) = admin_token { config.admin_token = Some(v.clone()); }
+            if let Some(v) = stale_timeout_secs { config.stale_timeout_secs = *v; }
+            if let Some(v) = cleanup_interval_secs { config.cleanup_interval_secs = *v; }
+            if let Some(v) = max_peers { config.max_peers = *v; }
+            if let Some(v) = default_listen_port { config.default_listen_port = *v; }
+            if let Some(v) = default_expiry_hours { config.default_expiry_hours = *v; }
+            if let Some(v) = default_max_uses { config.default_max_uses = *v; }
+            if let Some(v) = log_level { config.log_level = v.clone(); }
             coord::run(config).await?;
         }
         cli::CsAction::DbSetup => {

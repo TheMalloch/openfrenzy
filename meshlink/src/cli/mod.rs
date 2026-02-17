@@ -60,6 +60,10 @@ pub enum Command {
     },
     /// Coordination server management commands.
     Cs {
+        /// Path to the coord server config file.
+        #[arg(short, long, default_value = "/etc/meshlink/coord.toml")]
+        config: PathBuf,
+
         #[command(subcommand)]
         action: CsAction,
     },
@@ -68,7 +72,56 @@ pub enum Command {
 #[derive(Subcommand, Debug)]
 pub enum CsAction {
     /// Start the coordination server (UDP + HTTP).
-    Start,
+    Start {
+        /// PostgreSQL connection URL.
+        #[arg(long)]
+        database_url: Option<String>,
+        /// Mesh network CIDR (e.g. 10.0.0.0/24).
+        #[arg(long)]
+        mesh_cidr: Option<String>,
+        /// HTTP API port.
+        #[arg(long)]
+        http_port: Option<u16>,
+        /// UDP coordination port.
+        #[arg(long)]
+        udp_port: Option<u16>,
+        /// Interface to bind on (e.g. [::] or 0.0.0.0).
+        #[arg(long)]
+        bind_address: Option<String>,
+        /// Public address peers use to reach this server.
+        #[arg(long)]
+        external_address: Option<String>,
+        /// Path to TLS certificate file.
+        #[arg(long)]
+        tls_cert: Option<String>,
+        /// Path to TLS private key file.
+        #[arg(long)]
+        tls_key: Option<String>,
+        /// Admin API bearer token.
+        #[arg(long)]
+        admin_token: Option<String>,
+        /// Seconds before a peer is considered stale.
+        #[arg(long)]
+        stale_timeout_secs: Option<u64>,
+        /// Seconds between stale-peer cleanup runs.
+        #[arg(long)]
+        cleanup_interval_secs: Option<u64>,
+        /// Maximum number of peers (0 = unlimited).
+        #[arg(long)]
+        max_peers: Option<u32>,
+        /// Default listen port for new nodes.
+        #[arg(long)]
+        default_listen_port: Option<u16>,
+        /// Default invite expiry in hours.
+        #[arg(long)]
+        default_expiry_hours: Option<i64>,
+        /// Default max uses for new invites.
+        #[arg(long)]
+        default_max_uses: Option<i32>,
+        /// Log level (trace, debug, info, warn, error).
+        #[arg(long)]
+        log_level: Option<String>,
+    },
     /// Create database tables.
     DbSetup,
     /// Drop all database tables (destructive!).

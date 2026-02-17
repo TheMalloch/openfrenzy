@@ -21,6 +21,9 @@ pub struct AppState {
     pub ip_allocator: IpAllocator,
     pub coord_server_addr: String,
     pub admin_token: Option<String>,
+    pub default_listen_port: u16,
+    pub default_expiry_hours: i64,
+    pub default_max_uses: i32,
 }
 
 /// Build the Axum router with minimal API routes.
@@ -34,20 +37,27 @@ fn router(state: AppState) -> Router {
 /// Start the HTTP API server.
 pub async fn run_http_server(
     port: u16,
+    bind_address: String,
     db: Db,
     ip_allocator: IpAllocator,
     coord_server_addr: String,
     admin_token: Option<String>,
+    default_listen_port: u16,
+    default_expiry_hours: i64,
+    default_max_uses: i32,
 ) {
     let state = AppState {
         db,
         ip_allocator,
         coord_server_addr,
         admin_token,
+        default_listen_port,
+        default_expiry_hours,
+        default_max_uses,
     };
 
     let app = router(state);
-    let addr: SocketAddr = format!("[::]:{port}").parse().expect("valid listen address");
+    let addr: SocketAddr = format!("{bind_address}:{port}").parse().expect("valid listen address");
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .expect("bind HTTP listener");
@@ -201,7 +211,7 @@ async fn register(
         status: "registered".to_string(),
         endpoint: None,
         ipv6_endpoint: None,
-        listen_port: 51820,
+        listen_port: state.default_listen_port as i32,
         last_heartbeat: None,
         created_at: now,
         updated_at: now,
@@ -247,14 +257,9 @@ async fn register(
 
 #[derive(Deserialize)]
 struct CreateInviteRequest {
-    #[serde(default = "default_max_uses")]
-    max_uses: i32,
-    #[serde(default = "default_expires_hours")]
-    expires_in_hours: i64,
+    max_uses: Option<i32>,
+    expires_in_hours: Option<i64>,
 }
-
-fn default_max_uses() -> i32 { 1 }
-fn default_expires_hours() -> i64 { 24 }
 
 /// POST /api/v1/admin/invite
 async fn create_invite(
@@ -267,19 +272,21 @@ async fn create_invite(
     }
 
     let req = body.map(|Json(r)| r).unwrap_or(CreateInviteRequest {
-        max_uses: 1,
-        expires_in_hours: 24,
+        max_uses: None,
+        expires_in_hours: None,
     });
+    let max_uses = req.max_uses.unwrap_or(state.default_max_uses);
+    let expires_in_hours = req.expires_in_hours.unwrap_or(state.default_expiry_hours);
 
     let code = Uuid::new_v4().to_string();
-    let expires_at = Utc::now() + chrono::Duration::hours(req.expires_in_hours);
+    let expires_at = Utc::now() + chrono::Duration::hours(expires_in_hours);
 
-    if let Err(e) = state.db.create_invite(&code, expires_at, req.max_uses).await {
+    if let Err(e) = state.db.create_invite(&code, expires_at, max_uses).await {
         warn!(error = %e, "failed to create invite");
         return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
     }
 
-    info!(code = %code, max_uses = req.max_uses, "invite created");
+    info!(code = %code, max_uses, "invite created");
 
     (
         StatusCode::CREATED,
