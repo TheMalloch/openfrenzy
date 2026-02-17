@@ -1,4 +1,3 @@
-use crate::config::AclRule;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -16,8 +15,6 @@ pub struct PeerInfo {
     pub allowed_ips: Vec<ipnet::Ipv4Net>,
     pub tx_bytes: u64,
     pub rx_bytes: u64,
-    /// Outbound ACL rules for services on this peer.
-    pub acl_rules: Vec<AclRule>,
 }
 
 /// Packet with routing metadata, passed between tasks via channels.
@@ -35,8 +32,6 @@ pub struct SharedState {
     pub peers: Arc<RwLock<HashMap<PeerPublicKey, PeerInfo>>>,
     /// Route table: virtual_ip -> public_key (for fast outbound lookup)
     pub routes: Arc<RwLock<HashMap<std::net::Ipv4Addr, PeerPublicKey>>>,
-    /// Inbound ACL rules: who can reach our services
-    pub inbound_acl: Arc<RwLock<Vec<AclRule>>>,
 }
 
 impl SharedState {
@@ -44,7 +39,6 @@ impl SharedState {
         Self {
             peers: Arc::new(RwLock::new(HashMap::new())),
             routes: Arc::new(RwLock::new(HashMap::new())),
-            inbound_acl: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -93,51 +87,14 @@ impl SharedState {
         }
     }
 
-    /// Check outbound ACL: can we send to this peer's port/protocol?
-    /// Returns true if allowed (or no rules defined for this peer).
-    pub async fn check_outbound_acl(
-        &self,
-        peer_key: &PeerPublicKey,
-        dst_port: u16,
-        protocol: &str,
-    ) -> bool {
-        let peers = self.peers.read().await;
-        let peer = match peers.get(peer_key) {
-            Some(p) => p,
-            None => return false,
-        };
-
-        if peer.acl_rules.is_empty() {
-            return false; // default-deny: no rules means no access
+    /// Remove a peer by public key and clean up its routes.
+    pub async fn remove_peer(&self, key: &PeerPublicKey) {
+        if let Some(peer) = self.peers.write().await.remove(key) {
+            let mut routes = self.routes.write().await;
+            for net in &peer.allowed_ips {
+                routes.remove(&net.addr());
+            }
         }
-
-        peer.acl_rules.iter().any(|r| {
-            r.action == "allow"
-                && r.port == dst_port
-                && (r.protocol == protocol || r.protocol == "both")
-                && r.peer_ip == peer.virtual_ip
-        })
-    }
-
-    /// Check inbound ACL: can this source IP reach our dst_port/protocol?
-    /// Returns true if allowed (or no inbound rules defined).
-    pub async fn check_inbound_acl(
-        &self,
-        src_ip: std::net::Ipv4Addr,
-        dst_port: u16,
-        protocol: &str,
-    ) -> bool {
-        let rules = self.inbound_acl.read().await;
-        if rules.is_empty() {
-            return false; // default-deny
-        }
-
-        rules.iter().any(|r| {
-            r.action == "allow"
-                && r.peer_ip == src_ip
-                && r.port == dst_port
-                && (r.protocol == protocol || r.protocol == "both")
-        })
     }
 }
 

@@ -4,24 +4,12 @@ use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::Path;
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct AclRule {
-    pub peer_ip: std::net::Ipv4Addr,
-    pub port: u16,
-    pub protocol: String,
-    pub action: String,
-}
-
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub node: NodeConfig,
     pub coordination: CoordinationConfig,
     #[serde(default)]
     pub peers: Vec<PeerConfig>,
-    #[serde(default)]
-    pub acl: Vec<AclRule>,
-    #[serde(default)]
-    pub inbound_acl: Vec<AclRule>,
 }
 
 #[derive(Debug, Deserialize)]

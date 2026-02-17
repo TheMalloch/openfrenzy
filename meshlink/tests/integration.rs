@@ -163,7 +163,6 @@ async fn test_state_add_peer_and_lookup() {
             allowed_ips: vec!["10.0.0.2/32".parse().unwrap()],
             tx_bytes: 0,
             rx_bytes: 0,
-            acl_rules: Vec::new(),
         })
         .await;
 
@@ -189,7 +188,6 @@ async fn test_state_endpoint_and_stats() {
             allowed_ips: vec!["10.0.0.3/32".parse().unwrap()],
             tx_bytes: 0,
             rx_bytes: 0,
-            acl_rules: Vec::new(),
         })
         .await;
 
@@ -252,23 +250,46 @@ async fn test_coord_server_nat_detect() {
         let (_n, src) = server_sock.recv_from(&mut buf).await.unwrap();
         assert_eq!(buf[0], 0x10); // NAT detect request
 
-        // Respond with client's observed address
+        // Respond with client's observed address: [0x11][addr_type][ip...][port]
         let mut resp = vec![0x11u8];
-        if let std::net::IpAddr::V4(ip) = src.ip() {
-            resp.extend_from_slice(&ip.octets());
+        match src.ip() {
+            std::net::IpAddr::V4(ip) => {
+                resp.push(0x04);
+                resp.extend_from_slice(&ip.octets());
+            }
+            std::net::IpAddr::V6(ip) => {
+                resp.push(0x06);
+                resp.extend_from_slice(&ip.octets());
+            }
         }
         resp.extend_from_slice(&src.port().to_be_bytes());
         server_sock.send_to(&resp, src).await.unwrap();
     });
 
+    let (coord_tx, mut coord_rx) = tokio::sync::mpsc::channel::<meshlink::state::RoutedPacket>(16);
+
+    // Spawn a task to forward the server response to coord_rx
+    let fwd_sock = client_sock.clone();
+    let fwd_handle = tokio::spawn(async move {
+        let mut buf = [0u8; 128];
+        if let Ok((n, src)) = fwd_sock.recv_from(&mut buf).await {
+            let _ = coord_tx.send(meshlink::state::RoutedPacket {
+                data: buf[..n].to_vec(),
+                peer_endpoint: src,
+            }).await;
+        }
+    });
+
     let result =
-        meshlink::net::hole_punch::detect_nat(&client_sock, &server_addr).await;
+        meshlink::net::hole_punch::detect_nat(&client_sock, &server_addr, &mut coord_rx).await;
     assert!(result.is_ok());
 
     let detection = result.unwrap();
     assert!(detection.public_endpoint.is_some());
     let ep = detection.public_endpoint.unwrap();
     assert_eq!(ep.port(), client_addr.port());
+
+    fwd_handle.abort();
 
     server_handle.await.unwrap();
 }

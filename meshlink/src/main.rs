@@ -1,6 +1,7 @@
 mod api_client;
 mod cli;
 mod config;
+mod coord;
 mod credentials;
 mod crypto;
 mod discovery;
@@ -48,13 +49,12 @@ async fn main() -> Result<()> {
             println!("Sending shutdown signal...");
             return Ok(());
         }
-        Some(Command::Unregister { server }) => {
-            let config_dir = cli.config.parent().unwrap_or(Path::new("/etc/meshlink"));
-            return handle_unregister(server.as_deref(), config_dir).await;
-        }
         Some(Command::Setup { config_dir }) => {
             setup::run_setup(&config_dir)?;
             return Ok(());
+        }
+        Some(Command::Cs { action }) => {
+            return handle_cs_action(action).await;
         }
         Some(Command::Up {
             server,
@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
                 })?;
 
                 info!("registering with server {server_url}");
-                let client = api_client::ApiClient::new(server_url, None);
+                let client = api_client::ApiClient::new(server_url);
                 let resp = client.register(&invite_code, name.as_deref()).await?;
 
                 // Save credentials
@@ -97,67 +97,78 @@ async fn main() -> Result<()> {
                 println!();
             }
 
-            let server_params = cli::ServerParams::resolve(config_dir);
-            if server_params.is_none() {
-                anyhow::bail!(
-                    "No credentials found. Register first with:\n  \
-                     sudo meshlink up --server <URL> --invite <CODE>"
-                );
-            }
-            run_daemon(&cli.config, server_params, coord_server).await?;
+            run_daemon(&cli.config, coord_server).await?;
         }
         None => {
-            // Default: start the daemon with no server params
-            run_daemon(&cli.config, None, None).await?;
+            // Default: start the daemon
+            run_daemon(&cli.config, None).await?;
         }
     }
 
     Ok(())
 }
 
-/// Handle the `unregister` subcommand.
-async fn handle_unregister(server: Option<&str>, config_dir: &Path) -> Result<()> {
-    let creds = credentials::Credentials::load(config_dir)
-        .context("no credentials found — are you registered?")?;
+/// Handle coordination server subcommands.
+async fn handle_cs_action(action: cli::CsAction) -> Result<()> {
+    let config = coord::CoordServerConfig::from_env()?;
 
-    let server_url = server.unwrap_or(&creds.server);
-    let client = api_client::ApiClient::new(server_url, Some(creds.auth_token.clone()));
+    match action {
+        cli::CsAction::Start => {
+            coord::run(config).await?;
+        }
+        cli::CsAction::DbSetup => {
+            let db = coord::db::Db::connect(&config.database_url).await?;
+            db.setup_tables().await?;
+            println!("Database tables created.");
+        }
+        cli::CsAction::DbWipe => {
+            let db = coord::db::Db::connect(&config.database_url).await?;
+            db.drop_all_tables().await?;
+            println!("All tables dropped.");
+        }
+        cli::CsAction::KeyGen => {
+            let (private_key, public_key) = coord::key_manager::generate_node_keypair();
+            let priv_b64 = base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                private_key,
+            );
+            let pub_b64 = base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                public_key,
+            );
+            println!("Private key: {priv_b64}");
+            println!("Public key:  {pub_b64}");
+        }
+        cli::CsAction::CreateInvite { multi_use, max_uses, expires_hours } => {
+            let db = coord::db::Db::connect(&config.database_url).await?;
+            let code = uuid::Uuid::new_v4().to_string();
+            let expires_at = chrono::Utc::now() + chrono::Duration::hours(expires_hours);
+            let effective_max_uses = if multi_use { max_uses } else { 1 };
+            db.create_invite(&code, expires_at, effective_max_uses).await?;
+            println!("Invite code: {code}");
+            println!("Expires at:  {}", expires_at.to_rfc3339());
+            if multi_use {
+                if effective_max_uses == 0 {
+                    println!("Max uses:    unlimited");
+                } else {
+                    println!("Max uses:    {effective_max_uses}");
+                }
+            } else {
+                println!("Max uses:    1 (single-use)");
+            }
+        }
+    }
 
-    client.unregister(&creds.node_id).await?;
-
-    // Clean up local files
-    let _ = std::fs::remove_file(credentials::Credentials::path_in(config_dir));
-
-    println!("Node {} unregistered successfully.", creds.node_id);
     Ok(())
 }
 
 async fn run_daemon(
     config_path: &std::path::Path,
-    server_params: Option<cli::ServerParams>,
     coord_server_override: Option<String>,
 ) -> Result<()> {
     info!("MeshLink starting");
 
-    // If server mode, fetch config from API first
-    let mut config = if let Some(ref params) = server_params {
-        info!(server = %params.server, node_id = %params.node_id, "fetching config from server");
-        let client =
-            api_client::ApiClient::new(&params.server, Some(params.auth_token.clone()));
-        let config_toml = client.fetch_config(&params.node_id).await?;
-
-        // Write to disk for reference
-        if let Some(parent) = config_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| wrap_permission_error(e, "creating config directory"))?;
-        }
-        std::fs::write(config_path, &config_toml)
-            .map_err(|e| wrap_permission_error(e, "writing config file"))?;
-
-        config::Config::from_toml_string(&config_toml)?
-    } else {
-        config::Config::load(config_path)?
-    };
+    let mut config = config::Config::load(config_path)?;
 
     // Override coordination server if provided via CLI
     if let Some(addr) = coord_server_override {
@@ -206,14 +217,6 @@ async fn run_daemon(
             .map(|net| net.addr())
             .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
 
-        // Collect outbound ACL rules matching this peer's virtual IP
-        let peer_acl: Vec<config::AclRule> = config
-            .acl
-            .iter()
-            .filter(|r| r.peer_ip == virtual_ip)
-            .cloned()
-            .collect();
-
         let peer_info = state::PeerInfo {
             public_key: pub_key_bytes,
             endpoint: peer_config.endpoint,
@@ -221,15 +224,8 @@ async fn run_daemon(
             allowed_ips: peer_config.allowed_ips.clone(),
             tx_bytes: 0,
             rx_bytes: 0,
-            acl_rules: peer_acl,
         };
         shared_state.add_peer(peer_info).await;
-    }
-
-    // Load inbound ACL rules
-    if !config.inbound_acl.is_empty() {
-        info!(rules = config.inbound_acl.len(), "loading inbound ACL rules");
-        *shared_state.inbound_acl.write().await = config.inbound_acl.clone();
     }
 
     // Create TUN device
@@ -303,18 +299,6 @@ async fn run_daemon(
 
     let cli_listener = tokio::spawn(cli::cli_listener_task(shared_state.clone()));
 
-    // Spawn server heartbeat task if in server-orchestrated mode
-    let heartbeat_task = if let Some(params) = server_params {
-        Some(tokio::spawn(discovery::server_heartbeat_task(
-            shared_state.clone(),
-            params.server,
-            params.node_id,
-            params.auth_token,
-        )))
-    } else {
-        None
-    };
-
     info!("MeshLink running — press Ctrl+C to stop");
 
     // Wait for shutdown signal
@@ -333,9 +317,6 @@ async fn run_daemon(
     inbound_router.abort();
     discovery.abort();
     cli_listener.abort();
-    if let Some(ht) = heartbeat_task {
-        ht.abort();
-    }
 
     // Clean up socket file
     let _ = std::fs::remove_file(cli::socket_path());

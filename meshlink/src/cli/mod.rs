@@ -48,17 +48,40 @@ pub enum Command {
     Peers,
     /// Generate a new keypair.
     Genkey,
-    /// Unregister this node from the coordination server.
-    Unregister {
-        /// Server HTTP base URL.
-        #[arg(long)]
-        server: Option<String>,
-    },
     /// Initialize system directories, group, and permissions for meshlink.
     Setup {
         /// Configuration directory path.
         #[arg(long, default_value = "/etc/meshlink")]
         config_dir: PathBuf,
+    },
+    /// Coordination server management commands.
+    Cs {
+        #[command(subcommand)]
+        action: CsAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CsAction {
+    /// Start the coordination server (UDP + HTTP).
+    Start,
+    /// Create database tables.
+    DbSetup,
+    /// Drop all database tables (destructive!).
+    DbWipe,
+    /// Generate and print an X25519 keypair.
+    KeyGen,
+    /// Create a new node invite code.
+    CreateInvite {
+        /// Allow the invite to be used multiple times.
+        #[arg(long, default_value_t = false)]
+        multi_use: bool,
+        /// Maximum number of uses (0 = unlimited when --multi-use is set).
+        #[arg(long, default_value_t = 0)]
+        max_uses: i32,
+        /// Hours until the invite expires.
+        #[arg(long, default_value_t = 24)]
+        expires_hours: i64,
     },
 }
 

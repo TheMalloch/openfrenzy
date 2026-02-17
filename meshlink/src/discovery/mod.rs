@@ -1,4 +1,3 @@
-use crate::api_client::ApiClient;
 use crate::crypto::handshake::Identity;
 use crate::net::hole_punch;
 use crate::state::{RoutedPacket, SharedState};
@@ -126,6 +125,7 @@ fn parse_peer_list(data: &[u8]) -> Result<Vec<DiscoveredPeer>> {
 /// 2. Periodically request peer list
 /// 3. For new peers, attempt hole punching then handshake
 /// 4. Send keepalives to maintain our registration
+/// 5. Handle unsolicited peer list pushes from the server
 ///
 /// Coord protocol responses (0x11 NAT, 0x32 peer list) arrive via `coord_rx`,
 /// dispatched by `udp_reader_task`. This task only *sends* on the socket.
@@ -174,26 +174,7 @@ pub async fn discovery_task(
                 // Wait for peer list response on the coord channel
                 match timeout(Duration::from_secs(5), recv_peer_list(&mut coord_rx)).await {
                     Ok(Some(data)) => {
-                        match parse_peer_list(&data) {
-                            Ok(peers) => {
-                                debug!(count = peers.len(), "received peer list");
-                                for discovered in peers {
-                                    if discovered.public_key == our_pub_key {
-                                        continue; // Skip ourselves
-                                    }
-                                    process_discovered_peer(
-                                        &state,
-                                        &identity,
-                                        &socket,
-                                        &discovered,
-                                        &config_path,
-                                    ).await;
-                                }
-                            }
-                            Err(e) => {
-                                warn!(error = %e, "failed to parse peer list");
-                            }
-                        }
+                        process_peer_list_data(&data, &our_pub_key, &state, &identity, &socket, &config_path).await;
                     }
                     Ok(None) => {
                         debug!("coord channel closed");
@@ -209,6 +190,72 @@ pub async fn discovery_task(
                     warn!(error = %e, "keepalive send failed");
                 }
             }
+            // Handle unsolicited peer list pushes from the coordination server
+            Some(pkt) = coord_rx.recv() => {
+                if !pkt.data.is_empty() && pkt.data[0] == proto::PEER_LIST_RESP {
+                    info!("received pushed peer list from coordination server");
+                    process_peer_list_data(&pkt.data, &our_pub_key, &state, &identity, &socket, &config_path).await;
+                }
+            }
+        }
+    }
+}
+
+/// Process a raw peer list response: parse, update state, rewrite config.
+async fn process_peer_list_data(
+    data: &[u8],
+    our_pub_key: &[u8; 32],
+    state: &SharedState,
+    identity: &Identity,
+    socket: &Arc<UdpSocket>,
+    config_path: &std::path::Path,
+) {
+    match parse_peer_list(data) {
+        Ok(peers) => {
+            debug!(count = peers.len(), "received peer list");
+            let mut changed = false;
+            for discovered in &peers {
+                if discovered.public_key == *our_pub_key {
+                    continue; // Skip ourselves
+                }
+                let was_new = process_discovered_peer(
+                    state,
+                    identity,
+                    socket,
+                    discovered,
+                ).await;
+                if was_new {
+                    changed = true;
+                }
+            }
+
+            // Remove peers that are no longer in the server's list
+            let server_keys: Vec<[u8; 32]> = peers.iter()
+                .filter(|p| p.public_key != *our_pub_key)
+                .map(|p| p.public_key)
+                .collect();
+            let current_keys: Vec<[u8; 32]> = {
+                let peer_map = state.peers.read().await;
+                peer_map.keys().copied().collect()
+            };
+            for key in &current_keys {
+                if !server_keys.contains(key) {
+                    state.remove_peer(key).await;
+                    changed = true;
+                    let pub_key_b64 = base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        key,
+                    );
+                    info!(public_key = %pub_key_b64, "removed stale peer");
+                }
+            }
+
+            if changed {
+                rewrite_config_peers(config_path, state).await;
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to parse peer list");
         }
     }
 }
@@ -226,124 +273,36 @@ async fn recv_peer_list(coord_rx: &mut mpsc::Receiver<RoutedPacket>) -> Option<V
     None
 }
 
-/// Task: periodic heartbeat to the coordination server's REST API.
-/// If peers have changed, re-fetches the config and updates state.
-pub async fn server_heartbeat_task(
-    state: SharedState,
-    server_url: String,
-    node_id: String,
-    auth_token: String,
-) {
-    let client = ApiClient::new(&server_url, Some(auth_token));
-    let mut heartbeat_interval = interval(Duration::from_secs(30));
-
-    loop {
-        heartbeat_interval.tick().await;
-
-        match client.heartbeat(&node_id).await {
-            Ok(resp) => {
-                debug!(peers_changed = resp.peers_changed, "server heartbeat sent");
-
-                if resp.peers_changed {
-                    info!("peers changed, fetching updated config from server");
-
-                    match client.fetch_config(&node_id).await {
-                        Ok(config_toml) => {
-                            match crate::config::Config::from_toml_string(&config_toml) {
-                                Ok(config) => {
-                                    // Update peer state with new config
-                                    for peer_config in &config.peers {
-                                        let pub_key_bytes: [u8; 32] = match base64::Engine::decode(
-                                            &base64::engine::general_purpose::STANDARD,
-                                            &peer_config.public_key,
-                                        ) {
-                                            Ok(bytes) => match bytes.try_into() {
-                                                Ok(arr) => arr,
-                                                Err(_) => continue,
-                                            },
-                                            Err(_) => continue,
-                                        };
-
-                                        if state.get_peer(&pub_key_bytes).await.is_some() {
-                                            // Peer already known — update endpoint if the config has one
-                                            if let Some(ep) = peer_config.endpoint {
-                                                state.set_peer_endpoint(&pub_key_bytes, ep).await;
-                                            }
-                                        } else {
-                                            let virtual_ip = peer_config
-                                                .allowed_ips
-                                                .first()
-                                                .map(|net| net.addr())
-                                                .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
-
-                                            let peer_info = crate::state::PeerInfo {
-                                                public_key: pub_key_bytes,
-                                                endpoint: peer_config.endpoint,
-                                                virtual_ip,
-                                                allowed_ips: peer_config.allowed_ips.clone(),
-                                                tx_bytes: 0,
-                                                rx_bytes: 0,
-                                                acl_rules: Vec::new(),
-                                            };
-                                            state.add_peer(peer_info).await;
-                                            info!(vip = %virtual_ip, "added new peer from server config");
-                                        }
-                                    }
-
-                                    // Write updated config to disk
-                                    let _ = std::fs::write(
-                                        "/etc/meshlink/config.toml",
-                                        &config_toml,
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!(error = %e, "failed to parse updated config");
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "failed to fetch updated config");
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, "server heartbeat failed");
-            }
-        }
-    }
-}
-
 /// Process a newly discovered peer: update state, add if new, and hole punch for NAT traversal.
+/// Returns true if the peer was newly added.
 async fn process_discovered_peer(
     state: &SharedState,
     identity: &Identity,
     socket: &Arc<UdpSocket>,
     discovered: &DiscoveredPeer,
-    config_path: &std::path::Path,
-) {
+) -> bool {
     // Skip peers with real IPv6 endpoints — our socket is dual-stack but the
-    // peer may be unreachable if we have no IPv6 route. IPv4-mapped addresses
-    // are already normalized by udp_reader / coord server, so any remaining V6
-    // here is genuinely IPv6-only.
+    // peer may be unreachable if we have no IPv6 route.
     if discovered.endpoint.is_ipv6() {
         debug!(
             endpoint = %discovered.endpoint,
             vip = %discovered.virtual_ip,
             "skipping peer with IPv6 endpoint"
         );
-        return;
+        return false;
     }
 
     let existing = state.get_peer(&discovered.public_key).await;
+    let is_new;
 
-    if let Some(_) = existing {
+    if existing.is_some() {
         // Peer already known — just update endpoint
         state
             .set_peer_endpoint(&discovered.public_key, discovered.endpoint)
             .await;
+        is_new = false;
     } else if !discovered.virtual_ip.is_unspecified() {
-        // New peer with a valid virtual IP — add to state and config
+        // New peer with a valid virtual IP — add to state
         let allowed_ip: ipnet::Ipv4Net = format!("{}/32", discovered.virtual_ip)
             .parse()
             .expect("valid /32 net");
@@ -355,7 +314,6 @@ async fn process_discovered_peer(
             allowed_ips: vec![allowed_ip],
             tx_bytes: 0,
             rx_bytes: 0,
-            acl_rules: Vec::new(),
         };
         state.add_peer(peer_info).await;
 
@@ -369,12 +327,10 @@ async fn process_discovered_peer(
             public_key = %pub_key_b64,
             "added new discovered peer"
         );
-
-        // Append peer to config file
-        append_peer_to_config(config_path, &pub_key_b64, discovered.virtual_ip, discovered.endpoint);
+        is_new = true;
     } else {
         debug!(endpoint = %discovered.endpoint, "discovered peer has no virtual IP, skipping");
-        return;
+        return false;
     }
 
     // Attempt hole punch for NAT traversal
@@ -387,35 +343,54 @@ async fn process_discovered_peer(
     {
         warn!(error = %e, "hole punch failed");
     }
+
+    is_new
 }
 
-/// Append a new peer entry to the config TOML file.
-fn append_peer_to_config(
-    config_path: &std::path::Path,
-    public_key_b64: &str,
-    virtual_ip: std::net::Ipv4Addr,
-    endpoint: SocketAddr,
-) {
-    let peer_block = format!(
-        r#"
-[[peers]]
-public_key = "{public_key_b64}"
-allowed_ips = ["{virtual_ip}/32"]
-endpoint = "{endpoint}"
-"#,
-    );
+/// Rewrite the [[peers]] section of the config file from current SharedState.
+/// Preserves [node] and [coordination] sections, replaces all [[peers]] entries.
+async fn rewrite_config_peers(config_path: &std::path::Path, state: &SharedState) {
+    let peers = state.peers.read().await;
 
-    match std::fs::OpenOptions::new().append(true).open(config_path) {
-        Ok(mut file) => {
-            use std::io::Write;
-            if let Err(e) = file.write_all(peer_block.as_bytes()) {
-                warn!(error = %e, "failed to append peer to config file");
-            } else {
-                info!(path = %config_path.display(), "appended new peer to config file");
-            }
-        }
+    // Read existing config and keep everything before the first [[peers]]
+    let existing = match std::fs::read_to_string(config_path) {
+        Ok(s) => s,
         Err(e) => {
-            warn!(error = %e, path = %config_path.display(), "failed to open config file for appending");
+            warn!(error = %e, "failed to read config file for rewrite");
+            return;
         }
+    };
+
+    // Find where [[peers]] section starts (or end of file)
+    let peers_start = existing.find("\n[[peers]]")
+        .map(|i| i + 1) // keep the newline before
+        .unwrap_or(existing.len());
+
+    let mut new_config = existing[..peers_start].to_string();
+
+    // Ensure there's a trailing newline before peers section
+    if !new_config.ends_with('\n') {
+        new_config.push('\n');
+    }
+
+    // Write all current peers
+    for peer in peers.values() {
+        let pub_key_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            peer.public_key,
+        );
+        new_config.push_str(&format!(
+            "\n[[peers]]\npublic_key = \"{pub_key_b64}\"\nallowed_ips = [\"{}/32\"]\n",
+            peer.virtual_ip,
+        ));
+        if let Some(ep) = peer.endpoint {
+            new_config.push_str(&format!("endpoint = \"{ep}\"\n"));
+        }
+    }
+
+    if let Err(e) = std::fs::write(config_path, &new_config) {
+        warn!(error = %e, "failed to rewrite config file");
+    } else {
+        info!(path = %config_path.display(), peers = peers.len(), "rewrote config peers section");
     }
 }
