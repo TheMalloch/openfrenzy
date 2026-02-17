@@ -18,8 +18,109 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing::info;
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    // Commands that don't need a tokio runtime or tracing
+    match &cli.command {
+        Some(Command::Genkey) => {
+            // Need a minimal runtime for nothing here, but generate_keypair is sync
+            cli::generate_keypair();
+            return Ok(());
+        }
+        Some(Command::Down) => {
+            return handle_down();
+        }
+        Some(Command::Setup { config_dir }) => {
+            setup::run_setup(config_dir)?;
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    // Determine if we need to daemonize (only for Up without --foreground, or default)
+    let should_daemonize = match &cli.command {
+        Some(Command::Up { foreground, .. }) => !foreground,
+        None => true,
+        _ => false,
+    };
+
+    // For Up with --invite, do registration in foreground before daemonizing
+    if let Some(Command::Up {
+        server,
+        invite: Some(invite_code),
+        name,
+        ..
+    }) = &cli.command
+    {
+        // Need a temporary runtime for the HTTP registration call
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("building tokio runtime for registration")?;
+
+        rt.block_on(async {
+            let config_dir = cli.config.parent().unwrap_or(Path::new("/etc/meshlink"));
+            let server_url = server.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("--server is required when using --invite")
+            })?;
+
+            println!("Registering with server {server_url}...");
+            let client = api_client::ApiClient::new(server_url);
+            let resp = client.register(invite_code, name.as_deref()).await?;
+
+            // Save credentials
+            let creds = credentials::Credentials {
+                server: server_url.to_string(),
+                node_id: resp.node_id.clone(),
+                auth_token: resp.auth_token.clone(),
+            };
+            creds.save(config_dir)?;
+
+            // Write the config file
+            if let Some(parent) = cli.config.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| wrap_permission_error(e, "creating config directory"))?;
+            }
+            std::fs::write(&cli.config, &resp.config_toml)
+                .map_err(|e| wrap_permission_error(e, "writing config file"))?;
+
+            println!("Registration successful!");
+            println!("  Node ID:    {}", resp.node_id);
+            println!("  Virtual IP: {}", resp.virtual_ip);
+            println!("  Public Key: {}", resp.public_key);
+            println!();
+            Ok::<(), anyhow::Error>(())
+        })?;
+    }
+
+    // Daemonize if needed
+    if should_daemonize {
+        let pid_path = cli::pid_path();
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/var/log/meshlink.log")
+            .map_err(|e| wrap_permission_error(e, "opening /var/log/meshlink.log"))?;
+        let log_file_err = log_file.try_clone()?;
+
+        let daemonize = daemonize::Daemonize::new()
+            .pid_file(&pid_path)
+            .chown_pid_file(true)
+            .stdout(log_file)
+            .stderr(log_file_err);
+
+        match daemonize.start() {
+            Ok(()) => {
+                // We are now the child daemon process
+            }
+            Err(e) => {
+                anyhow::bail!("failed to daemonize: {e}");
+            }
+        }
+    }
+
+    // Initialize tracing (after daemonize so output goes to log file)
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -27,81 +128,84 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let cli = Cli::parse();
+    // Build tokio runtime manually (can't use #[tokio::main] after fork)
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("building tokio runtime")?;
 
-    match cli.command {
-        Some(Command::Genkey) => {
-            cli::generate_keypair();
-            return Ok(());
-        }
-        Some(Command::Status) => {
-            let resp = cli::send_command("status").await?;
-            print!("{resp}");
-            return Ok(());
-        }
-        Some(Command::Peers) => {
-            let resp = cli::send_command("peers").await?;
-            print!("{resp}");
-            return Ok(());
-        }
-        Some(Command::Down) => {
-            // TODO: signal the running daemon to shut down
-            println!("Sending shutdown signal...");
-            return Ok(());
-        }
-        Some(Command::Setup { config_dir }) => {
-            setup::run_setup(&config_dir)?;
-            return Ok(());
-        }
-        Some(Command::Cs { action }) => {
-            return handle_cs_action(action).await;
-        }
-        Some(Command::Up {
-            server,
-            invite,
-            name,
-            coord_server,
-        }) => {
-            let config_dir = cli.config.parent().unwrap_or(Path::new("/etc/meshlink"));
+    let coord_server_override = match &cli.command {
+        Some(Command::Up { coord_server, .. }) => coord_server.clone(),
+        _ => None,
+    };
 
-            // If --invite is provided, register first
-            if let Some(invite_code) = invite {
-                let server_url = server.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("--server is required when using --invite")
-                })?;
-
-                info!("registering with server {server_url}");
-                let client = api_client::ApiClient::new(server_url);
-                let resp = client.register(&invite_code, name.as_deref()).await?;
-
-                // Save credentials
-                let creds = credentials::Credentials {
-                    server: server_url.to_string(),
-                    node_id: resp.node_id.clone(),
-                    auth_token: resp.auth_token.clone(),
-                };
-                creds.save(config_dir)?;
-
-                // Write the config file
-                if let Some(parent) = cli.config.parent() {
-                    std::fs::create_dir_all(parent)
-                        .map_err(|e| wrap_permission_error(e, "creating config directory"))?;
-                }
-                std::fs::write(&cli.config, &resp.config_toml)
-                    .map_err(|e| wrap_permission_error(e, "writing config file"))?;
-
-                println!("Registration successful!");
-                println!("  Node ID:    {}", resp.node_id);
-                println!("  Virtual IP: {}", resp.virtual_ip);
-                println!("  Public Key: {}", resp.public_key);
-                println!();
+    rt.block_on(async {
+        match &cli.command {
+            Some(Command::Status) => {
+                let resp = cli::send_command("status").await?;
+                print!("{resp}");
             }
-
-            run_daemon(&cli.config, coord_server).await?;
+            Some(Command::Peers) => {
+                let resp = cli::send_command("peers").await?;
+                print!("{resp}");
+            }
+            Some(Command::Cs { action }) => {
+                return handle_cs_action(action).await;
+            }
+            Some(Command::Up { foreground, .. }) => {
+                run_daemon(&cli.config, coord_server_override, *foreground).await?;
+            }
+            None => {
+                run_daemon(&cli.config, None, !should_daemonize).await?;
+            }
+            _ => unreachable!(),
         }
-        None => {
-            // Default: start the daemon
-            run_daemon(&cli.config, None).await?;
+        Ok(())
+    })
+}
+
+/// Handle `meshlink down`: read PID file, send SIGTERM, wait for shutdown.
+fn handle_down() -> Result<()> {
+    let pid_path = cli::pid_path();
+
+    let pid_str = std::fs::read_to_string(&pid_path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            anyhow::anyhow!("MeshLink is not running (no PID file at {})", pid_path.display())
+        } else {
+            anyhow::Error::new(e).context(format!("reading PID file {}", pid_path.display()))
+        }
+    })?;
+
+    let pid: i32 = pid_str
+        .trim()
+        .parse()
+        .context("invalid PID in PID file")?;
+
+    println!("Sending shutdown signal to MeshLink (PID {pid})...");
+
+    // Send SIGTERM
+    let pid = nix::unistd::Pid::from_raw(pid);
+    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM)
+        .map_err(|e| anyhow::anyhow!("failed to send SIGTERM to PID {}: {e}", pid))?;
+
+    // Wait up to 5 seconds for the PID file to disappear
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if !pid_path.exists() {
+            println!("MeshLink stopped.");
+            return Ok(());
+        }
+    }
+
+    // Check if process is still alive
+    match nix::sys::signal::kill(pid, None) {
+        Ok(()) => {
+            println!("MeshLink is still shutting down (PID file remains).");
+        }
+        Err(_) => {
+            // Process is gone, clean up stale PID file
+            let _ = std::fs::remove_file(&pid_path);
+            println!("MeshLink stopped.");
         }
     }
 
@@ -109,7 +213,7 @@ async fn main() -> Result<()> {
 }
 
 /// Handle coordination server subcommands.
-async fn handle_cs_action(action: cli::CsAction) -> Result<()> {
+async fn handle_cs_action(action: &cli::CsAction) -> Result<()> {
     let config = coord::CoordServerConfig::from_env()?;
 
     match action {
@@ -142,12 +246,12 @@ async fn handle_cs_action(action: cli::CsAction) -> Result<()> {
         cli::CsAction::CreateInvite { multi_use, max_uses, expires_hours } => {
             let db = coord::db::Db::connect(&config.database_url).await?;
             let code = uuid::Uuid::new_v4().to_string();
-            let expires_at = chrono::Utc::now() + chrono::Duration::hours(expires_hours);
-            let effective_max_uses = if multi_use { max_uses } else { 1 };
+            let expires_at = chrono::Utc::now() + chrono::Duration::hours(*expires_hours);
+            let effective_max_uses = if *multi_use { *max_uses } else { 1 };
             db.create_invite(&code, expires_at, effective_max_uses).await?;
             println!("Invite code: {code}");
             println!("Expires at:  {}", expires_at.to_rfc3339());
-            if multi_use {
+            if *multi_use {
                 if effective_max_uses == 0 {
                     println!("Max uses:    unlimited");
                 } else {
@@ -165,6 +269,7 @@ async fn handle_cs_action(action: cli::CsAction) -> Result<()> {
 async fn run_daemon(
     config_path: &std::path::Path,
     coord_server_override: Option<String>,
+    foreground: bool,
 ) -> Result<()> {
     info!("MeshLink starting");
 
@@ -299,12 +404,26 @@ async fn run_daemon(
 
     let cli_listener = tokio::spawn(cli::cli_listener_task(shared_state.clone()));
 
-    info!("MeshLink running — press Ctrl+C to stop");
+    if foreground {
+        info!("MeshLink running in foreground — press Ctrl+C to stop");
+    } else {
+        info!("MeshLink daemon running (PID {})", std::process::id());
+    }
 
-    // Wait for shutdown signal
-    tokio::signal::ctrl_c()
-        .await
-        .context("waiting for ctrl-c")?;
+    // Wait for shutdown signal: SIGTERM for daemon mode, also Ctrl+C for foreground
+    let mut sigterm =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .context("registering SIGTERM handler")?;
+
+    tokio::select! {
+        _ = sigterm.recv() => {
+            info!("received SIGTERM");
+        }
+        result = tokio::signal::ctrl_c() => {
+            result.context("waiting for ctrl-c")?;
+            info!("received Ctrl+C");
+        }
+    }
 
     info!("shutting down");
 
@@ -320,6 +439,9 @@ async fn run_daemon(
 
     // Clean up socket file
     let _ = std::fs::remove_file(cli::socket_path());
+
+    // Clean up PID file
+    let _ = std::fs::remove_file(cli::pid_path());
 
     info!("MeshLink stopped");
     Ok(())

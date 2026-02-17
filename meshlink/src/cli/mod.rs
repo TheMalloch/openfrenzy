@@ -39,6 +39,10 @@ pub enum Command {
         /// Overrides the [coordination] server value in config.
         #[arg(long)]
         coord_server: Option<String>,
+
+        /// Run in the foreground instead of daemonizing.
+        #[arg(short = 'f', long)]
+        foreground: bool,
     },
     /// Stop the meshlink daemon.
     Down,
@@ -124,6 +128,11 @@ impl ServerParams {
 /// Default path for the runtime control unix socket.
 pub fn socket_path() -> PathBuf {
     PathBuf::from("/var/run/meshlink.sock")
+}
+
+/// Default path for the PID file.
+pub fn pid_path() -> PathBuf {
+    PathBuf::from("/var/run/meshlink.pid")
 }
 
 /// Task: listen on a unix socket for runtime control commands.

@@ -23,6 +23,8 @@ axum = "0.8"
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
+daemonize = "0.5"
+nix = { version = "0.29", features = ["signal", "process"] }
 
 [dev-dependencies]
 base64 = "0.22"
