@@ -2,7 +2,7 @@ use crate::crypto::handshake::Identity;
 use crate::net::hole_punch;
 use crate::state::{RoutedPacket, SharedState};
 use anyhow::Result;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -25,16 +25,46 @@ mod proto {
 #[derive(Debug, Clone)]
 pub struct DiscoveredPeer {
     pub public_key: [u8; 32],
-    pub virtual_ip: std::net::Ipv4Addr,
+    pub virtual_ip: Ipv4Addr,
     pub endpoint: SocketAddr,
+    pub lan_endpoint: Option<SocketAddr>,
 }
 
-/// Build a registration message.
-fn build_register_msg(public_key: &[u8; 32], listen_port: u16) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(35);
+/// Get LAN IPv4 addresses for this machine, excluding loopback, link-local,
+/// and the mesh virtual IP. Returns up to 4 addresses.
+fn get_lan_ips(exclude_vip: Ipv4Addr) -> Vec<Ipv4Addr> {
+    let mut ips = Vec::new();
+    if let Ok(ifaces) = if_addrs::get_if_addrs() {
+        for iface in ifaces {
+            if let std::net::IpAddr::V4(ip) = iface.ip() {
+                if ip.is_loopback() || ip.is_link_local() || ip == exclude_vip || ip.is_unspecified() {
+                    continue;
+                }
+                ips.push(ip);
+                if ips.len() >= 4 {
+                    break;
+                }
+            }
+        }
+    }
+    ips
+}
+
+/// Append LAN IPs to a message buffer: [lan_count:1][lan_ip_0:4]...[lan_ip_n:4]
+fn append_lan_ips(msg: &mut Vec<u8>, lan_ips: &[Ipv4Addr]) {
+    msg.push(lan_ips.len() as u8);
+    for ip in lan_ips {
+        msg.extend_from_slice(&ip.octets());
+    }
+}
+
+/// Build a registration message with LAN IPs.
+fn build_register_msg(public_key: &[u8; 32], listen_port: u16, lan_ips: &[Ipv4Addr]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(35 + 1 + lan_ips.len() * 4);
     msg.push(proto::REGISTER);
     msg.extend_from_slice(public_key);
     msg.extend_from_slice(&listen_port.to_be_bytes());
+    append_lan_ips(&mut msg, lan_ips);
     msg
 }
 
@@ -46,11 +76,12 @@ fn build_peer_list_req(public_key: &[u8; 32]) -> Vec<u8> {
     msg
 }
 
-/// Build a keepalive message.
-fn build_keepalive(public_key: &[u8; 32]) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(33);
+/// Build a keepalive message with LAN IPs.
+fn build_keepalive(public_key: &[u8; 32], lan_ips: &[Ipv4Addr]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(33 + 1 + lan_ips.len() * 4);
     msg.push(proto::KEEPALIVE);
     msg.extend_from_slice(public_key);
+    append_lan_ips(&mut msg, lan_ips);
     msg
 }
 
@@ -109,10 +140,24 @@ fn parse_peer_list(data: &[u8]) -> Result<Vec<DiscoveredPeer>> {
             }
         };
 
+        // Read optional LAN IP (4 bytes) appended by new-format servers
+        let lan_endpoint = if offset + 4 <= data.len() {
+            let lan_ip = Ipv4Addr::new(data[offset], data[offset + 1], data[offset + 2], data[offset + 3]);
+            offset += 4;
+            if !lan_ip.is_unspecified() {
+                Some(SocketAddr::new(IpAddr::V4(lan_ip), endpoint.port()))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         peers.push(DiscoveredPeer {
             public_key,
             virtual_ip,
             endpoint,
+            lan_endpoint,
         });
     }
 
@@ -136,12 +181,15 @@ pub async fn discovery_task(
     coord_addr: SocketAddr,
     listen_port: u16,
     config_path: std::path::PathBuf,
+    virtual_ip: Ipv4Addr,
     mut coord_rx: mpsc::Receiver<RoutedPacket>,
 ) {
     let our_pub_key = identity.public_key_bytes();
+    let lan_ips = get_lan_ips(virtual_ip);
+    info!(?lan_ips, "detected LAN IPs");
 
-    // Initial registration
-    let reg_msg = build_register_msg(&our_pub_key, listen_port);
+    // Initial registration with LAN IPs
+    let reg_msg = build_register_msg(&our_pub_key, listen_port, &lan_ips);
     if let Err(e) = socket.send_to(&reg_msg, coord_addr).await {
         error!(error = %e, "failed to register with coordination server");
         return;
@@ -152,6 +200,9 @@ pub async fn discovery_task(
     match hole_punch::detect_nat(&socket, &coord_addr, &mut coord_rx).await {
         Ok(detection) => {
             info!(?detection, "NAT detection result");
+            if let Some(ep) = detection.public_endpoint {
+                state.set_our_public_ip(ep.ip()).await;
+            }
         }
         Err(e) => {
             warn!(error = %e, "NAT detection failed, continuing anyway");
@@ -160,6 +211,7 @@ pub async fn discovery_task(
 
     let mut discovery_interval = interval(Duration::from_secs(30));
     let mut keepalive_interval = interval(Duration::from_secs(25));
+    let mut reregister_interval = interval(Duration::from_secs(300)); // 5 minutes
 
     loop {
         tokio::select! {
@@ -185,9 +237,38 @@ pub async fn discovery_task(
                 }
             }
             _ = keepalive_interval.tick() => {
-                let msg = build_keepalive(&our_pub_key);
+                let current_lan_ips = get_lan_ips(virtual_ip);
+                let msg = build_keepalive(&our_pub_key, &current_lan_ips);
                 if let Err(e) = socket.send_to(&msg, coord_addr).await {
                     warn!(error = %e, "keepalive send failed");
+                }
+            }
+            _ = reregister_interval.tick() => {
+                // Periodic re-register: updates coord server with our current
+                // public IP (UDP source) and fresh LAN IPs
+                let current_lan_ips = get_lan_ips(virtual_ip);
+                let reg_msg = build_register_msg(&our_pub_key, listen_port, &current_lan_ips);
+                if let Err(e) = socket.send_to(&reg_msg, coord_addr).await {
+                    warn!(error = %e, "periodic re-register failed");
+                } else {
+                    debug!(?current_lan_ips, "periodic re-register sent");
+                }
+
+                // Re-run NAT detection to catch public IP changes
+                match hole_punch::detect_nat(&socket, &coord_addr, &mut coord_rx).await {
+                    Ok(detection) => {
+                        if let Some(ep) = detection.public_endpoint {
+                            let old_ip = state.get_our_public_ip().await;
+                            let new_ip = ep.ip();
+                            if old_ip != Some(new_ip) {
+                                info!(?old_ip, %new_ip, "public IP changed");
+                            }
+                            state.set_our_public_ip(new_ip).await;
+                        }
+                    }
+                    Err(e) => {
+                        debug!(error = %e, "periodic NAT re-detection failed");
+                    }
                 }
             }
             // Handle unsolicited peer list pushes from the coordination server
@@ -273,6 +354,23 @@ async fn recv_peer_list(coord_rx: &mut mpsc::Receiver<RoutedPacket>) -> Option<V
     None
 }
 
+/// Choose the best endpoint for a discovered peer.
+/// If the peer shares our public IP (same NAT), prefer the LAN endpoint.
+fn select_endpoint(discovered: &DiscoveredPeer, our_public_ip: Option<IpAddr>) -> SocketAddr {
+    if let (Some(our_ip), Some(lan_ep)) = (our_public_ip, discovered.lan_endpoint) {
+        if discovered.endpoint.ip() == our_ip {
+            info!(
+                public = %discovered.endpoint,
+                lan = %lan_ep,
+                vip = %discovered.virtual_ip,
+                "same-NAT peer detected, using LAN endpoint"
+            );
+            return lan_ep;
+        }
+    }
+    discovered.endpoint
+}
+
 /// Process a newly discovered peer: update state, add if new, and hole punch for NAT traversal.
 /// Returns true if the peer was newly added.
 async fn process_discovered_peer(
@@ -292,13 +390,16 @@ async fn process_discovered_peer(
         return false;
     }
 
+    let our_public_ip = state.get_our_public_ip().await;
+    let effective_endpoint = select_endpoint(discovered, our_public_ip);
+
     let existing = state.get_peer(&discovered.public_key).await;
     let is_new;
 
     if existing.is_some() {
         // Peer already known — just update endpoint
         state
-            .set_peer_endpoint(&discovered.public_key, discovered.endpoint)
+            .set_peer_endpoint(&discovered.public_key, effective_endpoint)
             .await;
         is_new = false;
     } else if !discovered.virtual_ip.is_unspecified() {
@@ -309,7 +410,7 @@ async fn process_discovered_peer(
 
         let peer_info = crate::state::PeerInfo {
             public_key: discovered.public_key,
-            endpoint: Some(discovered.endpoint),
+            endpoint: Some(effective_endpoint),
             virtual_ip: discovered.virtual_ip,
             allowed_ips: vec![allowed_ip],
             tx_bytes: 0,
@@ -323,7 +424,7 @@ async fn process_discovered_peer(
         );
         info!(
             vip = %discovered.virtual_ip,
-            endpoint = %discovered.endpoint,
+            endpoint = %effective_endpoint,
             public_key = %pub_key_b64,
             "added new discovered peer"
         );
@@ -333,10 +434,10 @@ async fn process_discovered_peer(
         return false;
     }
 
-    // Attempt hole punch for NAT traversal
+    // Attempt hole punch for NAT traversal (use effective endpoint)
     if let Err(e) = hole_punch::punch_hole(
         socket,
-        discovered.endpoint,
+        effective_endpoint,
         &identity.public_key_bytes(),
     )
     .await

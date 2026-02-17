@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 
@@ -32,6 +32,8 @@ pub struct SharedState {
     pub peers: Arc<RwLock<HashMap<PeerPublicKey, PeerInfo>>>,
     /// Route table: virtual_ip -> public_key (for fast outbound lookup)
     pub routes: Arc<RwLock<HashMap<std::net::Ipv4Addr, PeerPublicKey>>>,
+    /// Our detected public IP (from NAT detection), used for same-NAT peer detection.
+    pub our_public_ip: Arc<RwLock<Option<IpAddr>>>,
 }
 
 impl SharedState {
@@ -39,7 +41,18 @@ impl SharedState {
         Self {
             peers: Arc::new(RwLock::new(HashMap::new())),
             routes: Arc::new(RwLock::new(HashMap::new())),
+            our_public_ip: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Store our detected public IP address.
+    pub async fn set_our_public_ip(&self, ip: IpAddr) {
+        *self.our_public_ip.write().await = Some(ip);
+    }
+
+    /// Get our detected public IP address.
+    pub async fn get_our_public_ip(&self) -> Option<IpAddr> {
+        *self.our_public_ip.read().await
     }
 
     /// Register a peer and update the route table for their allowed IPs.

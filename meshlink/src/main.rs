@@ -438,6 +438,7 @@ async fn run_daemon(
         coord_addr,
         actual_port,
         config_path.to_path_buf(),
+        config.node.virtual_ip.addr(),
         coord_rx,
     ));
 

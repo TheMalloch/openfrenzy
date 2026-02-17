@@ -211,6 +211,7 @@ async fn register(
         status: "registered".to_string(),
         endpoint: None,
         ipv6_endpoint: None,
+        lan_endpoint: None,
         listen_port: state.default_listen_port as i32,
         last_heartbeat: None,
         created_at: now,

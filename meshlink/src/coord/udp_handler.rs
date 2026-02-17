@@ -30,6 +30,7 @@ pub struct RegisteredPeer {
     pub listen_port: u16,
     pub last_seen: Instant,
     pub virtual_ip: Option<std::net::Ipv4Addr>,
+    pub lan_ip: Option<std::net::Ipv4Addr>,
 }
 
 /// Shared peer map type used across UDP server and stale checker.
@@ -202,9 +203,43 @@ async fn build_peer_list_response(
             resp.extend_from_slice(&[0, 0, 0, 0]);
             resp.extend_from_slice(&0u16.to_be_bytes());
         }
+
+        // Append LAN IP (4 bytes): prefer in-memory, fall back to DB
+        let lan_ip = peer_map
+            .get(&pub_key)
+            .and_then(|p| p.lan_ip)
+            .or_else(|| {
+                node.lan_endpoint.as_ref().and_then(|ep| {
+                    // lan_endpoint is stored as "ip:port", extract just the IP
+                    ep.split(':').next().and_then(|s| s.parse::<std::net::Ipv4Addr>().ok())
+                })
+            });
+        resp.extend_from_slice(&lan_ip.unwrap_or(std::net::Ipv4Addr::UNSPECIFIED).octets());
     }
 
     resp
+}
+
+/// Parse optional LAN IPs from the tail of a message.
+/// Format: [lan_count:1][lan_ip_0:4]...[lan_ip_n:4]
+/// Returns the first non-loopback, non-link-local LAN IP found.
+fn parse_lan_ips(data: &[u8], offset: usize) -> Option<std::net::Ipv4Addr> {
+    if offset >= data.len() {
+        return None;
+    }
+    let count = data[offset] as usize;
+    let mut pos = offset + 1;
+    for _ in 0..count {
+        if pos + 4 > data.len() {
+            break;
+        }
+        let ip = std::net::Ipv4Addr::new(data[pos], data[pos + 1], data[pos + 2], data[pos + 3]);
+        pos += 4;
+        if !ip.is_loopback() && !ip.is_link_local() && !ip.is_unspecified() {
+            return Some(ip);
+        }
+    }
+    None
 }
 
 async fn handle_message(
@@ -270,6 +305,9 @@ async fn handle_register(
     public_key.copy_from_slice(&data[1..33]);
     let listen_port = u16::from_be_bytes([data[33], data[34]]);
 
+    // Parse optional LAN IPs from extended register message (byte 35+)
+    let lan_ip = parse_lan_ips(data, 35);
+
     let is_new = {
         let map = peers.lock().await;
         !map.contains_key(&public_key)
@@ -294,6 +332,7 @@ async fn handle_register(
                 listen_port,
                 last_seen: Instant::now(),
                 virtual_ip,
+                lan_ip,
             },
         );
     }
@@ -329,8 +368,16 @@ async fn handle_register(
         debug!(%src, "skipping DB endpoint update for loopback address");
     }
 
+    // Persist LAN endpoint to database
+    if let Some(lip) = lan_ip {
+        let lan_str = format!("{}:{}", lip, listen_port);
+        if let Err(e) = database.update_lan_endpoint_by_pubkey(&public_key, Some(&lan_str)).await {
+            warn!(error = %e, %src, "failed to persist LAN endpoint");
+        }
+    }
+
     if is_new {
-        info!(%src, listen_port, "new peer registered");
+        info!(%src, listen_port, ?lan_ip, "new peer registered");
         // Broadcast updated peer list to all connected peers
         broadcast_peer_list(socket, peers, database).await;
     } else {
@@ -384,12 +431,16 @@ async fn handle_keepalive(
     let mut public_key = [0u8; 32];
     public_key.copy_from_slice(&data[1..33]);
 
+    // Parse optional LAN IPs from extended keepalive (byte 33+)
+    let lan_ip = parse_lan_ips(data, 33);
+
     {
         let mut map = peers.lock().await;
         if let Some(peer) = map.get_mut(&public_key) {
             peer.last_seen = Instant::now();
             peer.endpoint = src;
-            debug!(%src, "keepalive received");
+            peer.lan_ip = lan_ip.or(peer.lan_ip);
+            debug!(%src, ?lan_ip, "keepalive received");
         } else {
             // After server restart, in-memory map is empty. Re-register the peer.
             let virtual_ip = match database.get_node_by_pubkey(&public_key).await {
@@ -407,6 +458,7 @@ async fn handle_keepalive(
                     listen_port: src.port(),
                     last_seen: Instant::now(),
                     virtual_ip,
+                    lan_ip,
                 },
             );
             info!(%src, "re-registered peer from keepalive");
@@ -420,5 +472,17 @@ async fn handle_keepalive(
         .await
     {
         warn!(error = %e, %src, "failed to persist keepalive endpoint to database");
+    }
+
+    // Persist LAN endpoint to database if provided
+    if let Some(lip) = lan_ip {
+        let listen_port = {
+            let map = peers.lock().await;
+            map.get(&public_key).map(|p| p.listen_port).unwrap_or(src.port())
+        };
+        let lan_str = format!("{}:{}", lip, listen_port);
+        if let Err(e) = database.update_lan_endpoint_by_pubkey(&public_key, Some(&lan_str)).await {
+            warn!(error = %e, %src, "failed to persist keepalive LAN endpoint");
+        }
     }
 }

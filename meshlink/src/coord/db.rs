@@ -16,6 +16,7 @@ pub struct NodeRecord {
     pub status: String,
     pub endpoint: Option<String>,
     pub ipv6_endpoint: Option<String>,
+    pub lan_endpoint: Option<String>,
     pub listen_port: i32,
     pub last_heartbeat: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
@@ -102,6 +103,10 @@ impl Db {
             .execute(&self.pool)
             .await
             .context("migrating nodes: ipv6_endpoint")?;
+        sqlx::query("ALTER TABLE nodes ADD COLUMN IF NOT EXISTS lan_endpoint TEXT")
+            .execute(&self.pool)
+            .await
+            .context("migrating nodes: lan_endpoint")?;
 
         info!("database tables created");
         Ok(())
@@ -241,6 +246,24 @@ impl Db {
         .execute(&self.pool)
         .await
         .context("updating endpoint by public key")?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Update a node's LAN endpoint by its public key.
+    pub async fn update_lan_endpoint_by_pubkey(
+        &self,
+        public_key: &[u8],
+        lan_endpoint: Option<&str>,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            r#"UPDATE nodes SET lan_endpoint = $1, updated_at = NOW()
+               WHERE public_key = $2 AND status IN ('registered', 'active')"#,
+        )
+        .bind(lan_endpoint)
+        .bind(public_key)
+        .execute(&self.pool)
+        .await
+        .context("updating LAN endpoint by public key")?;
         Ok(result.rows_affected() > 0)
     }
 
