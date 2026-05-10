@@ -1,8 +1,10 @@
 pub mod api;
+pub mod caddy;
 pub mod config_generator;
 pub mod db;
 pub mod ip_allocator;
 pub mod key_manager;
+pub mod port_allocator;
 pub mod udp_handler;
 
 use anyhow::{Context, Result};
@@ -33,6 +35,13 @@ pub struct CoordServerConfig {
     pub default_expiry_hours: i64,
     pub default_max_uses: i32,
     pub log_level: String,
+    // Port range allocation
+    pub port_range_base: u16,
+    pub port_range_block_size: u16,
+    // Caddy integration
+    pub caddy_config_path: String,
+    pub caddy_admin_api: String,
+    pub caddy_external_domain: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -51,6 +60,10 @@ pub struct CoordConfigFile {
     pub invites: InvitesConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub ports: PortsConfig,
+    #[serde(default)]
+    pub caddy: CaddyConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,6 +176,40 @@ impl Default for LoggingConfig {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct PortsConfig {
+    pub range_base: u16,
+    pub block_size: u16,
+}
+
+impl Default for PortsConfig {
+    fn default() -> Self {
+        Self {
+            range_base: 9000,
+            block_size: 100,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct CaddyConfig {
+    pub config_path: String,
+    pub admin_api: String,
+    pub external_domain: String,
+}
+
+impl Default for CaddyConfig {
+    fn default() -> Self {
+        Self {
+            config_path: "/etc/caddy/meshlink.conf".into(),
+            admin_api: "http://localhost:2019".into(),
+            external_domain: String::new(),
+        }
+    }
+}
+
 impl CoordServerConfig {
     /// Load configuration from a TOML file.
     pub fn load(path: &Path) -> Result<Self> {
@@ -210,6 +257,11 @@ impl CoordServerConfig {
             default_expiry_hours: 24,
             default_max_uses: 1,
             log_level: std::env::var("LOG_LEVEL").unwrap_or_else(|_| "info".into()),
+            port_range_base: 9000,
+            port_range_block_size: 100,
+            caddy_config_path: "/etc/caddy/meshlink.conf".into(),
+            caddy_admin_api: "http://localhost:2019".into(),
+            caddy_external_domain: std::env::var("CADDY_EXTERNAL_DOMAIN").unwrap_or_default(),
         })
     }
 
@@ -236,6 +288,11 @@ impl CoordServerConfig {
             default_expiry_hours: file.invites.default_expiry_hours,
             default_max_uses: file.invites.default_max_uses,
             log_level: file.logging.level,
+            port_range_base: file.ports.range_base,
+            port_range_block_size: file.ports.block_size,
+            caddy_config_path: file.caddy.config_path,
+            caddy_admin_api: file.caddy.admin_api,
+            caddy_external_domain: file.caddy.external_domain,
         }
     }
 }
@@ -249,6 +306,12 @@ pub async fn run(config: CoordServerConfig) -> Result<()> {
     // Set up IP allocator
     let ip_allocator = ip_allocator::IpAllocator::new(&config.mesh_network)
         .context("initializing IP allocator")?;
+
+    // Set up port allocator
+    let port_allocator = port_allocator::PortAllocator::new(
+        config.port_range_base,
+        config.port_range_block_size,
+    );
 
     if config.admin_token.is_some() {
         info!("admin API enabled (ADMIN_TOKEN set)");
@@ -288,11 +351,17 @@ pub async fn run(config: CoordServerConfig) -> Result<()> {
         config.bind_address.clone(),
         http_db,
         ip_allocator,
+        port_allocator,
         config.coord_server_addr,
         config.admin_token,
         config.default_listen_port,
         config.default_expiry_hours,
         config.default_max_uses,
+        udp_socket.clone(),
+        peers.clone(),
+        config.caddy_config_path,
+        config.caddy_admin_api,
+        config.caddy_external_domain,
     ));
 
     // Start stale node checker with shared socket and peers for broadcasting

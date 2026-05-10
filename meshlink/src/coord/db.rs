@@ -21,6 +21,8 @@ pub struct NodeRecord {
     pub last_heartbeat: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub port_range_start: Option<i32>,
+    pub port_range_size: Option<i32>,
 }
 
 /// An invite record from the database.
@@ -107,6 +109,14 @@ impl Db {
             .execute(&self.pool)
             .await
             .context("migrating nodes: lan_endpoint")?;
+        sqlx::query("ALTER TABLE nodes ADD COLUMN IF NOT EXISTS port_range_start INTEGER")
+            .execute(&self.pool)
+            .await
+            .context("migrating nodes: port_range_start")?;
+        sqlx::query("ALTER TABLE nodes ADD COLUMN IF NOT EXISTS port_range_size INTEGER")
+            .execute(&self.pool)
+            .await
+            .context("migrating nodes: port_range_size")?;
 
         info!("database tables created");
         Ok(())
@@ -133,8 +143,8 @@ impl Db {
         sqlx::query(
             r#"INSERT INTO nodes (node_id, node_name, public_key, private_key_encrypted,
                virtual_ip, auth_token, status, endpoint, ipv6_endpoint, listen_port,
-               last_heartbeat, created_at, updated_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)"#,
+               last_heartbeat, created_at, updated_at, port_range_start, port_range_size)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)"#,
         )
         .bind(&node.node_id)
         .bind(&node.node_name)
@@ -149,6 +159,8 @@ impl Db {
         .bind(node.last_heartbeat)
         .bind(node.created_at)
         .bind(node.updated_at)
+        .bind(node.port_range_start)
+        .bind(node.port_range_size)
         .execute(&self.pool)
         .await
         .context("inserting node")?;
@@ -326,6 +338,17 @@ impl Db {
         Ok(())
     }
 
+    /// Update a node's status and update updated_at timestamp.
+    pub async fn set_node_status(&self, node_id: &str, status: &str) -> Result<()> {
+        sqlx::query("UPDATE nodes SET status = $1, updated_at = NOW() WHERE node_id = $2")
+            .bind(status)
+            .bind(node_id)
+            .execute(&self.pool)
+            .await
+            .context("setting node status")?;
+        Ok(())
+    }
+
     // --- IP allocation helper ---
 
     /// Get all virtual IPs currently allocated to active/registered nodes.
@@ -337,5 +360,52 @@ impl Db {
         .await
         .context("listing allocated IPs")?;
         Ok(rows.into_iter().map(|(ip,)| ip).collect())
+    }
+
+    // --- Admin queries ---
+
+    /// List all nodes (all statuses), ordered by creation time.
+    pub async fn list_all_nodes(&self) -> Result<Vec<NodeRecord>> {
+        let nodes = sqlx::query_as::<_, NodeRecord>(
+            "SELECT * FROM nodes ORDER BY created_at",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("listing all nodes")?;
+        Ok(nodes)
+    }
+
+    /// List all invites, ordered by creation time.
+    pub async fn list_all_invites(&self) -> Result<Vec<InviteRecord>> {
+        let invites = sqlx::query_as::<_, InviteRecord>(
+            "SELECT * FROM invites ORDER BY created_at",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("listing all invites")?;
+        Ok(invites)
+    }
+
+    /// Revoke an invite by setting its expiry to NOW().
+    pub async fn revoke_invite(&self, code: &str) -> Result<bool> {
+        let result = sqlx::query("UPDATE invites SET expires_at = NOW() WHERE code = $1")
+            .bind(code)
+            .execute(&self.pool)
+            .await
+            .context("revoking invite")?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Get all allocated port_range_start values for active/registered nodes.
+    pub async fn allocated_port_ranges(&self) -> Result<Vec<i32>> {
+        let rows: Vec<(i32,)> = sqlx::query_as(
+            "SELECT port_range_start FROM nodes \
+             WHERE status IN ('registered', 'active') \
+             AND port_range_start IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("listing allocated port ranges")?;
+        Ok(rows.into_iter().map(|(s,)| s).collect())
     }
 }

@@ -86,9 +86,16 @@ fn main() -> Result<()> {
                 .map_err(|e| wrap_permission_error(e, "writing config file"))?;
 
             println!("Registration successful!");
-            println!("  Node ID:    {}", resp.node_id);
-            println!("  Virtual IP: {}", resp.virtual_ip);
-            println!("  Public Key: {}", resp.public_key);
+            println!("  Node ID:      {}", resp.node_id);
+            println!("  Virtual IP:   {}", resp.virtual_ip);
+            println!("  Public Key:   {}", resp.public_key);
+            if resp.port_range_size > 0 {
+                println!(
+                    "  Port Range:   {}-{}",
+                    resp.port_range_start,
+                    resp.port_range_start + resp.port_range_size - 1
+                );
+            }
             println!();
             Ok::<(), anyhow::Error>(())
         })?;
@@ -240,6 +247,11 @@ async fn handle_cs_action(config_path: &std::path::Path, action: &cli::CsAction)
             default_expiry_hours,
             default_max_uses,
             log_level,
+            port_range_base,
+            port_range_block_size,
+            caddy_config_path,
+            caddy_admin_api,
+            caddy_external_domain,
         } => {
             if let Some(v) = database_url { config.database_url = v.clone(); }
             if let Some(v) = mesh_cidr { config.mesh_network = v.clone(); }
@@ -257,6 +269,11 @@ async fn handle_cs_action(config_path: &std::path::Path, action: &cli::CsAction)
             if let Some(v) = default_expiry_hours { config.default_expiry_hours = *v; }
             if let Some(v) = default_max_uses { config.default_max_uses = *v; }
             if let Some(v) = log_level { config.log_level = v.clone(); }
+            if let Some(v) = port_range_base { config.port_range_base = *v; }
+            if let Some(v) = port_range_block_size { config.port_range_block_size = *v; }
+            if let Some(v) = caddy_config_path { config.caddy_config_path = v.clone(); }
+            if let Some(v) = caddy_admin_api { config.caddy_admin_api = v.clone(); }
+            if let Some(v) = caddy_external_domain { config.caddy_external_domain = v.clone(); }
             coord::run(config).await?;
         }
         cli::CsAction::DbSetup => {
@@ -299,6 +316,122 @@ async fn handle_cs_action(config_path: &std::path::Path, action: &cli::CsAction)
             } else {
                 println!("Max uses:    1 (single-use)");
             }
+        }
+        cli::CsAction::ListPeers => {
+            let db = coord::db::Db::connect(&config.database_url).await?;
+            let nodes = db.list_all_nodes().await?;
+            if nodes.is_empty() {
+                println!("No peers registered.");
+            } else {
+                println!(
+                    "{:<38} {:<16} {:<16} {:<15} {:<13} {:<20}",
+                    "NODE ID", "NAME", "VIRTUAL IP", "STATUS", "PORT RANGE", "LAST SEEN"
+                );
+                println!("{}", "-".repeat(120));
+                for n in &nodes {
+                    let name = n.node_name.as_deref().unwrap_or("-");
+                    let vip = n.virtual_ip.split('/').next().unwrap_or(&n.virtual_ip);
+                    let port_range = match (n.port_range_start, n.port_range_size) {
+                        (Some(s), Some(z)) => format!("{}-{}", s, s + z - 1),
+                        _ => "-".to_string(),
+                    };
+                    let last_seen = n
+                        .last_heartbeat
+                        .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+                        .unwrap_or_else(|| "-".to_string());
+                    println!(
+                        "{:<38} {:<16} {:<16} {:<15} {:<13} {:<20}",
+                        n.node_id, name, vip, n.status, port_range, last_seen
+                    );
+                }
+            }
+        }
+        cli::CsAction::ShowPeer { id } => {
+            let db = coord::db::Db::connect(&config.database_url).await?;
+            match db.get_node(id).await? {
+                None => println!("Peer not found: {id}"),
+                Some(n) => {
+                    let vip = n.virtual_ip.split('/').next().unwrap_or(&n.virtual_ip);
+                    let port_range = match (n.port_range_start, n.port_range_size) {
+                        (Some(s), Some(z)) => format!("{}-{}", s, s + z - 1),
+                        _ => "-".to_string(),
+                    };
+                    println!("Node ID:        {}", n.node_id);
+                    println!("Name:           {}", n.node_name.as_deref().unwrap_or("-"));
+                    println!("Virtual IP:     {vip}");
+                    println!("Status:         {}", n.status);
+                    println!("Port range:     {port_range}");
+                    println!("Endpoint:       {}", n.endpoint.as_deref().unwrap_or("-"));
+                    println!("IPv6 endpoint:  {}", n.ipv6_endpoint.as_deref().unwrap_or("-"));
+                    println!("LAN endpoint:   {}", n.lan_endpoint.as_deref().unwrap_or("-"));
+                    println!("Listen port:    {}", n.listen_port);
+                    println!("Last heartbeat: {}", n.last_heartbeat.map(|t| t.to_rfc3339()).unwrap_or_else(|| "-".to_string()));
+                    println!("Created at:     {}", n.created_at.to_rfc3339());
+                    println!("Updated at:     {}", n.updated_at.to_rfc3339());
+                }
+            }
+        }
+        cli::CsAction::DisablePeer { id } => {
+            let db = coord::db::Db::connect(&config.database_url).await?;
+            db.set_node_status(id, "deregistered").await?;
+            println!("Peer {id} disabled.");
+            // Regen Caddy
+            let nodes = db.list_all_nodes().await?;
+            let content = coord::caddy::generate_caddyfile(&nodes, &config.caddy_external_domain);
+            coord::caddy::write_and_reload(&config.caddy_config_path, &config.caddy_admin_api, &content).await?;
+        }
+        cli::CsAction::EnablePeer { id } => {
+            let db = coord::db::Db::connect(&config.database_url).await?;
+            db.set_node_status(id, "registered").await?;
+            println!("Peer {id} enabled.");
+            // Regen Caddy
+            let nodes = db.list_all_nodes().await?;
+            let content = coord::caddy::generate_caddyfile(&nodes, &config.caddy_external_domain);
+            coord::caddy::write_and_reload(&config.caddy_config_path, &config.caddy_admin_api, &content).await?;
+        }
+        cli::CsAction::ListInvites => {
+            let db = coord::db::Db::connect(&config.database_url).await?;
+            let invites = db.list_all_invites().await?;
+            if invites.is_empty() {
+                println!("No invites.");
+            } else {
+                println!(
+                    "{:<38} {:<6} {:<6} {:<32} {:<8}",
+                    "CODE", "USES", "MAX", "EXPIRES", "STATUS"
+                );
+                println!("{}", "-".repeat(95));
+                for inv in &invites {
+                    let expired = inv.expires_at < chrono::Utc::now();
+                    let exhausted = inv.max_uses > 0 && inv.use_count >= inv.max_uses;
+                    let status = if exhausted { "exhausted" } else if expired { "expired" } else { "active" };
+                    let max_str = if inv.max_uses == 0 { "∞".to_string() } else { inv.max_uses.to_string() };
+                    println!(
+                        "{:<38} {:<6} {:<6} {:<32} {:<8}",
+                        inv.code,
+                        inv.use_count,
+                        max_str,
+                        inv.expires_at.format("%Y-%m-%d %H:%M:%S UTC"),
+                        status
+                    );
+                }
+            }
+        }
+        cli::CsAction::RevokeInvite { code } => {
+            let db = coord::db::Db::connect(&config.database_url).await?;
+            if db.revoke_invite(code).await? {
+                println!("Invite {code} revoked.");
+            } else {
+                println!("Invite not found: {code}");
+            }
+        }
+        cli::CsAction::CaddyRegen => {
+            let db = coord::db::Db::connect(&config.database_url).await?;
+            let nodes = db.list_all_nodes().await?;
+            let content = coord::caddy::generate_caddyfile(&nodes, &config.caddy_external_domain);
+            println!("--- Generated Caddyfile ---");
+            print!("{content}");
+            coord::caddy::write_and_reload(&config.caddy_config_path, &config.caddy_admin_api, &content).await?;
+            println!("Caddy config written to {} and reloaded.", config.caddy_config_path);
         }
     }
 

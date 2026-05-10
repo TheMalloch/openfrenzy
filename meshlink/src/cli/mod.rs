@@ -121,6 +121,21 @@ pub enum CsAction {
         /// Log level (trace, debug, info, warn, error).
         #[arg(long)]
         log_level: Option<String>,
+        /// Base port for per-peer port range allocation.
+        #[arg(long)]
+        port_range_base: Option<u16>,
+        /// Number of ports per peer block.
+        #[arg(long)]
+        port_range_block_size: Option<u16>,
+        /// Path to write the generated Caddy config file.
+        #[arg(long)]
+        caddy_config_path: Option<String>,
+        /// Caddy admin API URL (e.g. http://localhost:2019).
+        #[arg(long)]
+        caddy_admin_api: Option<String>,
+        /// Public domain used in generated Caddy server blocks.
+        #[arg(long)]
+        caddy_external_domain: Option<String>,
     },
     /// Create database tables.
     DbSetup,
@@ -140,6 +155,32 @@ pub enum CsAction {
         #[arg(long, default_value_t = 24)]
         expires_hours: i64,
     },
+    /// List all registered peers.
+    ListPeers,
+    /// Show detail for a single peer.
+    ShowPeer {
+        /// Node ID of the peer to show.
+        id: String,
+    },
+    /// Disable a peer (sets status to deregistered).
+    DisablePeer {
+        /// Node ID of the peer to disable.
+        id: String,
+    },
+    /// Re-enable a disabled peer.
+    EnablePeer {
+        /// Node ID of the peer to enable.
+        id: String,
+    },
+    /// List all invite codes.
+    ListInvites,
+    /// Revoke an invite code immediately.
+    RevokeInvite {
+        /// The invite code to revoke.
+        code: String,
+    },
+    /// Regenerate Caddy config from database and reload Caddy.
+    CaddyRegen,
 }
 
 /// Parameters for server-orchestrated mode, resolved from CLI args, credentials, or env vars.
