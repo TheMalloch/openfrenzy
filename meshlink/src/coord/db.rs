@@ -37,6 +37,17 @@ pub struct InviteRecord {
     pub use_count: i32,
 }
 
+/// A stored update record.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct UpdateRecord {
+    pub id: i64,
+    pub description: String,
+    pub binary_hash: String,
+    pub binary_size: i64,
+    pub uploaded_by: String,
+    pub uploaded_at: DateTime<Utc>,
+}
+
 /// Database handle wrapping a PostgreSQL connection pool.
 #[derive(Clone)]
 pub struct Db {
@@ -117,6 +128,20 @@ impl Db {
             .execute(&self.pool)
             .await
             .context("migrating nodes: port_range_size")?;
+
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS updates (
+                id BIGSERIAL PRIMARY KEY,
+                description TEXT NOT NULL,
+                binary_hash TEXT NOT NULL,
+                binary_size BIGINT NOT NULL,
+                uploaded_by TEXT NOT NULL,
+                uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )"#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("creating updates table")?;
 
         info!("database tables created");
         Ok(())
@@ -407,5 +432,72 @@ impl Db {
         .await
         .context("listing allocated port ranges")?;
         Ok(rows.into_iter().map(|(s,)| s).collect())
+    }
+
+    // --- Update operations ---
+
+    /// Insert an update record and return its assigned ID.
+    pub async fn insert_update(
+        &self,
+        description: &str,
+        binary_hash: &str,
+        binary_size: i64,
+        uploaded_by: &str,
+    ) -> Result<i64> {
+        let row: (i64,) = sqlx::query_as(
+            r#"INSERT INTO updates (description, binary_hash, binary_size, uploaded_by)
+               VALUES ($1, $2, $3, $4) RETURNING id"#,
+        )
+        .bind(description)
+        .bind(binary_hash)
+        .bind(binary_size)
+        .bind(uploaded_by)
+        .fetch_one(&self.pool)
+        .await
+        .context("inserting update record")?;
+        Ok(row.0)
+    }
+
+    /// Return the most recently uploaded update, if any.
+    pub async fn get_latest_update(&self) -> Result<Option<UpdateRecord>> {
+        sqlx::query_as::<_, UpdateRecord>(
+            "SELECT * FROM updates ORDER BY uploaded_at DESC LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .context("fetching latest update")
+    }
+
+    /// Return all updates, newest first.
+    pub async fn list_updates(&self) -> Result<Vec<UpdateRecord>> {
+        sqlx::query_as::<_, UpdateRecord>("SELECT * FROM updates ORDER BY uploaded_at DESC")
+            .fetch_all(&self.pool)
+            .await
+            .context("listing updates")
+    }
+
+    /// Replace a node's auth_token with a new one.
+    pub async fn rotate_node_token(&self, node_id: &str, new_token: &str) -> Result<()> {
+        sqlx::query("UPDATE nodes SET auth_token = $1, updated_at = NOW() WHERE node_id = $2")
+            .bind(new_token)
+            .bind(node_id)
+            .execute(&self.pool)
+            .await
+            .context("rotating node token")?;
+        Ok(())
+    }
+
+    /// Validate a peer bearer token. Returns the node_id when the token belongs to
+    /// an active or registered node, None otherwise.
+    pub async fn validate_peer_token(&self, token: &str) -> Result<Option<String>> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT node_id FROM nodes \
+             WHERE auth_token = $1 AND status IN ('registered', 'active')",
+        )
+        .bind(token)
+        .fetch_optional(&self.pool)
+        .await
+        .context("validating peer token")?;
+        Ok(row.map(|(id,)| id))
     }
 }

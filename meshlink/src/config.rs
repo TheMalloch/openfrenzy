@@ -4,12 +4,44 @@ use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::Path;
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct PeerApiConfig {
+    pub enabled: bool,
+    pub port: u16,
+    pub read_token: Option<String>,
+    pub bind_cidr: Option<String>,
+    pub tls_enabled: bool,
+    pub tls_cert: Option<String>,
+    pub tls_key: Option<String>,
+    pub mtls_enabled: bool,
+    pub mtls_ca: Option<String>,
+}
+
+impl Default for PeerApiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: 4100,
+            read_token: None,
+            bind_cidr: None,
+            tls_enabled: false,
+            tls_cert: None,
+            tls_key: None,
+            mtls_enabled: false,
+            mtls_ca: None,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub node: NodeConfig,
     pub coordination: CoordinationConfig,
     #[serde(default)]
     pub peers: Vec<PeerConfig>,
+    #[serde(default)]
+    pub peer_api: PeerApiConfig,
 }
 
 #[derive(Debug, Deserialize)]

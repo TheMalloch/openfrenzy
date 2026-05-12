@@ -1,0 +1,51 @@
+[Unit]
+Description=MeshLink Peer Node
+Documentation=file:///home/openfrenzy/readme.md
+After=network-online.target systemd-modules-load.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=meshlink
+Group=meshlink
+
+# Config is read from /etc/meshlink/config.toml (written by `meshlink up --invite`).
+# Credentials are read from /etc/meshlink/credentials.json.
+ExecStart=/usr/local/bin/meshlink up --foreground
+ExecStop=/usr/local/bin/meshlink down
+
+# Peer daemon handles SIGTERM natively
+KillSignal=SIGTERM
+TimeoutStopSec=15s
+
+Restart=on-failure
+RestartSec=10s
+StartLimitIntervalSec=120s
+StartLimitBurst=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=meshlink-peer
+
+# Capabilities for TUN device creation and raw socket access.
+# These match what install.sh sets via setcap — whichever is present wins.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+
+# Filesystem hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# Peer writes: config dir (credentials, config.toml), runtime socket and PID
+ReadWritePaths=/etc/meshlink /var/run
+
+# TUN device access
+DeviceAllow=/dev/net/tun rw
+DevicePolicy=closed
+
+# Network
+PrivateNetwork=no
+
+[Install]
+WantedBy=multi-user.target

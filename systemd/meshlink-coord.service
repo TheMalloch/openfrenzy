@@ -1,0 +1,51 @@
+[Unit]
+Description=MeshLink Coordination Server
+Documentation=file:///home/openfrenzy/readme.md
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=meshlink
+Group=meshlink
+
+# Secrets file — copy and fill in before starting:
+#   DATABASE_URL=postgres:///meshlink?user=meshlink
+#   ADMIN_TOKEN=your-secret-token
+#   MESH_NETWORK=10.0.0.0/24
+#   HTTP_PORT=4001
+#   UDP_PORT=4000
+#   EXTERNAL_ADDRESS=your.server.com
+#   UPDATES_DIR=/var/lib/meshlink/updates
+#   CADDY_EXTERNAL_DOMAIN=your.server.com   # optional
+EnvironmentFile=/etc/meshlink/coord.env
+
+ExecStart=/usr/local/bin/meshlink cs start
+
+# coord server handles SIGINT (tokio ctrl_c handler)
+KillSignal=SIGINT
+TimeoutStopSec=15s
+
+Restart=on-failure
+RestartSec=5s
+StartLimitIntervalSec=60s
+StartLimitBurst=3
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=meshlink-coord
+
+# Filesystem hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# Coord server writes: update store, Caddy config, and its own config dir
+ReadWritePaths=/var/lib/meshlink /etc/meshlink /etc/caddy
+
+# Network
+PrivateNetwork=no
+
+[Install]
+WantedBy=multi-user.target

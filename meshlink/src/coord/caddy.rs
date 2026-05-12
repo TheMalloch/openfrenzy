@@ -1,4 +1,4 @@
-use super::db::NodeRecord;
+use super::db::{Db, NodeRecord};
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
@@ -48,6 +48,18 @@ pub fn generate_caddyfile(peers: &[NodeRecord], external_domain: &str) -> String
     }
 
     out
+}
+
+/// Fetch all nodes from `db`, regenerate the Caddyfile, and reload Caddy.
+pub async fn regen_from_db(
+    db: &Db,
+    config_path: &str,
+    admin_api: &str,
+    external_domain: &str,
+) -> Result<()> {
+    let nodes = db.list_all_nodes().await.context("listing nodes for Caddy regen")?;
+    let content = generate_caddyfile(&nodes, external_domain);
+    write_and_reload(config_path, admin_api, &content).await
 }
 
 /// Write `content` to `config_path` then reload Caddy.

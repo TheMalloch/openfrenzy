@@ -1,21 +1,30 @@
+use super::admin_html::ADMIN_PAGE;
 use super::caddy;
 use super::config_generator;
 use super::db::{Db, NodeRecord};
 use super::ip_allocator::IpAllocator;
 use super::key_manager;
 use super::port_allocator::PortAllocator;
+use super::scanner::{ScanState, SseTx};
 use super::udp_handler::{self, PeerMap};
-use axum::extract::{Path, State};
+use super::update_store::UpdateStore;
+use axum::body::Bytes;
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
-use axum::routing::{delete, get, post};
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{Html, IntoResponse};
+use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use base64::Engine;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::StreamExt;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -35,6 +44,9 @@ pub struct AppState {
     pub caddy_config_path: String,
     pub caddy_admin_api: String,
     pub caddy_external_domain: String,
+    pub update_store: UpdateStore,
+    pub scan_state: ScanState,
+    pub sse_tx: SseTx,
 }
 
 /// Build the Axum router with all API routes.
@@ -50,6 +62,19 @@ fn router(state: AppState) -> Router {
         // Admin invite endpoints
         .route("/api/v1/admin/invites", get(list_invites))
         .route("/api/v1/admin/invites/:code", delete(revoke_invite))
+        // Peer token rotation (authenticated with current peer token)
+        .route("/api/v1/node/token", patch(rotate_peer_token))
+        // Update distribution (admin or peer token)
+        .route("/api/v1/update", post(publish_update))
+        .route("/api/v1/update/latest", get(get_latest_update))
+        .route("/api/v1/update/latest/binary", get(download_latest_binary))
+        // Admin-only update history
+        .route("/api/v1/admin/updates", get(list_updates))
+        // Service discovery + admin UI
+        .route("/api/v1/admin/services", get(get_services))
+        .route("/api/v1/admin/stream", get(sse_stream))
+        .route("/admin", get(admin_ui))
+        .route("/admin/", get(admin_ui))
         .with_state(state)
 }
 
@@ -71,6 +96,9 @@ pub async fn run_http_server(
     caddy_config_path: String,
     caddy_admin_api: String,
     caddy_external_domain: String,
+    update_store: UpdateStore,
+    scan_state: ScanState,
+    sse_tx: SseTx,
 ) {
     let state = AppState {
         db,
@@ -86,6 +114,9 @@ pub async fn run_http_server(
         caddy_config_path,
         caddy_admin_api,
         caddy_external_domain,
+        update_store,
+        scan_state,
+        sse_tx,
     };
 
     let app = router(state);
@@ -223,22 +254,15 @@ fn validate_admin_token(
 
 /// Regenerate Caddy config from DB and reload.
 async fn regen_caddy(state: &AppState) {
-    match state.db.list_all_nodes().await {
-        Ok(nodes) => {
-            let content = caddy::generate_caddyfile(&nodes, &state.caddy_external_domain);
-            if let Err(e) = caddy::write_and_reload(
-                &state.caddy_config_path,
-                &state.caddy_admin_api,
-                &content,
-            )
-            .await
-            {
-                warn!(error = %e, "Caddy regen failed");
-            }
-        }
-        Err(e) => {
-            warn!(error = %e, "failed to query nodes for Caddy regen");
-        }
+    if let Err(e) = caddy::regen_from_db(
+        &state.db,
+        &state.caddy_config_path,
+        &state.caddy_admin_api,
+        &state.caddy_external_domain,
+    )
+    .await
+    {
+        warn!(error = %e, "Caddy regen failed");
     }
 }
 
@@ -555,5 +579,346 @@ async fn revoke_invite(
             error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Peer token rotation
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct RotateTokenRequest {
+    new_token: String,
+}
+
+/// PATCH /api/v1/node/token
+/// The peer authenticates with its current token, sends a new one in the body.
+async fn rotate_peer_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<RotateTokenRequest>,
+) -> impl IntoResponse {
+    let provided = match extract_token(&headers) {
+        Some(t) => t,
+        None => return error_response(StatusCode::UNAUTHORIZED, "missing Authorization").into_response(),
+    };
+
+    let node_id = match state.db.validate_peer_token(&provided).await {
+        Ok(Some(id)) => id,
+        Ok(None) => return error_response(StatusCode::UNAUTHORIZED, "invalid token").into_response(),
+        Err(e) => {
+            warn!(error = %e, "db error validating token for rotation");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    };
+
+    if req.new_token.len() < 16 {
+        return error_response(StatusCode::BAD_REQUEST, "new_token too short").into_response();
+    }
+
+    if let Err(e) = state.db.rotate_node_token(&node_id, &req.new_token).await {
+        warn!(error = %e, "failed to rotate token");
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+    }
+
+    info!(%node_id, "peer token rotated");
+    StatusCode::OK.into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Update distribution
+// ---------------------------------------------------------------------------
+
+/// Resolve the caller's identity from the Authorization header.
+/// Accepts an admin token (returns "admin") or a peer auth_token (returns node_id).
+/// Returns Err with an HTTP response on failure.
+async fn resolve_caller(
+    admin_token: &Option<String>,
+    db: &Db,
+    headers: &HeaderMap,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let provided = extract_token(headers).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "missing Authorization header".into(),
+            }),
+        )
+    })?;
+
+    // Admin token wins immediately.
+    if let Some(admin) = admin_token {
+        if provided == *admin {
+            return Ok("admin".to_string());
+        }
+    }
+
+    // Try peer token.
+    match db.validate_peer_token(&provided).await {
+        Ok(Some(node_id)) => Ok(node_id),
+        Ok(None) => Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "invalid token".into(),
+            }),
+        )),
+        Err(e) => {
+            warn!(error = %e, "db error validating peer token");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "internal error".into(),
+                }),
+            ))
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct UpdateMeta {
+    id: i64,
+    description: String,
+    binary_hash: String,
+    binary_size: i64,
+    uploaded_by: String,
+    uploaded_at: chrono::DateTime<Utc>,
+}
+
+impl From<super::db::UpdateRecord> for UpdateMeta {
+    fn from(r: super::db::UpdateRecord) -> Self {
+        Self {
+            id: r.id,
+            description: r.description,
+            binary_hash: r.binary_hash,
+            binary_size: r.binary_size,
+            uploaded_by: r.uploaded_by,
+            uploaded_at: r.uploaded_at,
+        }
+    }
+}
+
+/// POST /api/v1/update
+/// Upload a new binary update. Body = raw binary bytes.
+/// Required headers:
+///   Authorization: Bearer <admin_token or peer_auth_token>
+///   X-Update-Description: <non-empty description>
+async fn publish_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let caller = match resolve_caller(&state.admin_token, &state.db, &headers).await {
+        Ok(id) => id,
+        Err(resp) => return resp.into_response(),
+    };
+
+    let description = match headers
+        .get("x-update-description")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+    {
+        Some(d) if !d.is_empty() => d,
+        _ => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "X-Update-Description header is required and must not be empty",
+            )
+            .into_response()
+        }
+    };
+
+    if body.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "binary body must not be empty")
+            .into_response();
+    }
+
+    let hash = format!("{:x}", Sha256::digest(&body));
+    let size = body.len() as i64;
+
+    let id = match state.db.insert_update(&description, &hash, size, &caller).await {
+        Ok(id) => id,
+        Err(e) => {
+            warn!(error = %e, "failed to insert update record");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+                .into_response();
+        }
+    };
+
+    if let Err(e) = state.update_store.store(id, &body).await {
+        warn!(error = %e, "failed to store update binary");
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed to store binary")
+            .into_response();
+    }
+
+    info!(id, %caller, bytes = size, "update published");
+
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "id": id,
+            "binary_hash": hash,
+            "binary_size": size,
+            "uploaded_by": caller,
+            "description": description,
+        })),
+    )
+        .into_response()
+}
+
+/// GET /api/v1/update/latest
+/// Return metadata for the most recently published update.
+async fn get_latest_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(resp) = resolve_caller(&state.admin_token, &state.db, &headers).await {
+        return resp.into_response();
+    }
+
+    match state.db.get_latest_update().await {
+        Ok(Some(rec)) => Json(UpdateMeta::from(rec)).into_response(),
+        Ok(None) => error_response(StatusCode::NOT_FOUND, "no updates available").into_response(),
+        Err(e) => {
+            warn!(error = %e, "failed to fetch latest update");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
+    }
+}
+
+/// GET /api/v1/update/latest/binary
+/// Download the binary of the most recently published update.
+async fn download_latest_binary(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(resp) = resolve_caller(&state.admin_token, &state.db, &headers).await {
+        return resp.into_response();
+    }
+
+    let rec = match state.db.get_latest_update().await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return error_response(StatusCode::NOT_FOUND, "no updates available").into_response()
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to fetch latest update");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+                .into_response();
+        }
+    };
+
+    match state.update_store.load(rec.id).await {
+        Ok(data) => (
+            StatusCode::OK,
+            [
+                ("content-type", "application/octet-stream"),
+                ("x-update-id", &rec.id.to_string()),
+                ("x-binary-hash", &rec.binary_hash),
+            ],
+            data,
+        )
+            .into_response(),
+        Err(e) => {
+            warn!(error = %e, id = rec.id, "failed to load update binary");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "binary not found").into_response()
+        }
+    }
+}
+
+/// GET /api/v1/admin/updates
+/// List all published updates (admin only).
+async fn list_updates(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(resp) = validate_admin_token(&state.admin_token, &headers) {
+        return resp.into_response();
+    }
+
+    match state.db.list_updates().await {
+        Ok(recs) => {
+            let metas: Vec<UpdateMeta> = recs.into_iter().map(UpdateMeta::from).collect();
+            Json(metas).into_response()
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to list updates");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Admin UI + service discovery
+// ---------------------------------------------------------------------------
+
+/// GET /admin — serve the brutalist admin page (no server-side auth; the page
+/// handles auth client-side and sends the token with every API request).
+async fn admin_ui() -> Html<&'static str> {
+    Html(ADMIN_PAGE)
+}
+
+/// GET /api/v1/admin/services — current scan snapshot (admin token required).
+async fn get_services(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(resp) = validate_admin_token(&state.admin_token, &headers) {
+        return resp.into_response();
+    }
+
+    let snap = state.scan_state.read().await;
+    let list: Vec<&super::scanner::PeerSnapshot> = snap.values().collect();
+    Json(list).into_response()
+}
+
+/// GET /api/v1/admin/stream?token=<admin_token>
+/// SSE stream: broadcasts a full peer snapshot JSON array on every scan.
+/// Token is passed as a query param because EventSource does not support headers.
+/// The server validates it independently — no link to any cookie or session.
+async fn sse_stream(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let token = params.get("token").cloned().unwrap_or_default();
+
+    // Server-side auth: validate admin token independently.
+    let is_valid = state
+        .admin_token
+        .as_ref()
+        .map(|t| *t == token)
+        .unwrap_or(false);
+
+    if !is_valid {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [("content-type", "text/plain")],
+            "invalid token",
+        )
+            .into_response();
+    }
+
+    // Send current snapshot immediately so the page renders without waiting
+    // for the next scan cycle.
+    let initial = {
+        let snap = state.scan_state.read().await;
+        let list: Vec<&super::scanner::PeerSnapshot> = snap.values().collect();
+        serde_json::to_string(&list).unwrap_or_else(|_| "[]".into())
+    };
+
+    let rx = state.sse_tx.subscribe();
+    let stream = tokio_stream::once(Ok::<Event, std::convert::Infallible>(
+        Event::default().data(initial),
+    ))
+    .chain(
+        BroadcastStream::new(rx).map(|msg| {
+            Ok::<Event, std::convert::Infallible>(match msg {
+                Ok(data) => Event::default().data(data),
+                Err(_) => Event::default().comment("lagged"),
+            })
+        }),
+    );
+
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 

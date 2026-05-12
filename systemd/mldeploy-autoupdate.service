@@ -1,0 +1,52 @@
+[Unit]
+Description=MeshLink Auto-Update Daemon
+Documentation=file:///home/openfrenzy/readme.md
+After=network-online.target meshlink-peer.service
+Wants=network-online.target
+# Peer must be up so the mesh route to the coord server is reachable
+After=meshlink-peer.service
+
+[Service]
+Type=simple
+User=meshlink
+Group=meshlink
+
+# Token and server URL are auto-loaded from /etc/meshlink/credentials.json.
+# Override any value here if needed:
+#   Environment=MESHLINK_SERVER=http://coord.example.com:4001
+#   Environment=MESHLINK_AUTH_TOKEN=override-token
+#
+# Poll interval and destination path:
+#   --interval  seconds between checks (default 300)
+#   --dest      binary to replace on update (default /usr/local/bin/mldeploy)
+#   --post-cmd  optional shell command after a successful update
+ExecStart=/usr/local/bin/mldeploy auto-update \
+    --interval 300 \
+    --dest /usr/local/bin/mldeploy
+
+KillSignal=SIGTERM
+TimeoutStopSec=10s
+
+Restart=on-failure
+RestartSec=30s
+StartLimitIntervalSec=300s
+StartLimitBurst=3
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mldeploy-autoupdate
+
+# Filesystem hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# Needs to read credentials and write the replacement binary
+ReadOnlyPaths=/etc/meshlink
+ReadWritePaths=/usr/local/bin
+
+# Network
+PrivateNetwork=no
+
+[Install]
+WantedBy=multi-user.target

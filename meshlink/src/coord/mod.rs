@@ -1,3 +1,4 @@
+pub mod admin_html;
 pub mod api;
 pub mod caddy;
 pub mod config_generator;
@@ -5,7 +6,9 @@ pub mod db;
 pub mod ip_allocator;
 pub mod key_manager;
 pub mod port_allocator;
+pub mod scanner;
 pub mod udp_handler;
+pub mod update_store;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -42,6 +45,10 @@ pub struct CoordServerConfig {
     pub caddy_config_path: String,
     pub caddy_admin_api: String,
     pub caddy_external_domain: String,
+    // Update distribution
+    pub updates_dir: String,
+    // Service scanner
+    pub scan_interval_secs: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,6 +71,10 @@ pub struct CoordConfigFile {
     pub ports: PortsConfig,
     #[serde(default)]
     pub caddy: CaddyConfig,
+    #[serde(default)]
+    pub updates: UpdatesConfig,
+    #[serde(default)]
+    pub scanner: ScannerConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -210,6 +221,33 @@ impl Default for CaddyConfig {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct UpdatesConfig {
+    pub dir: String,
+}
+
+impl Default for UpdatesConfig {
+    fn default() -> Self {
+        Self {
+            dir: "/var/lib/meshlink/updates".into(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct ScannerConfig {
+    /// Seconds between TCP port scans of all active peers.
+    pub interval_secs: u64,
+}
+
+impl Default for ScannerConfig {
+    fn default() -> Self {
+        Self { interval_secs: 30 }
+    }
+}
+
 impl CoordServerConfig {
     /// Load configuration from a TOML file.
     pub fn load(path: &Path) -> Result<Self> {
@@ -262,6 +300,9 @@ impl CoordServerConfig {
             caddy_config_path: "/etc/caddy/meshlink.conf".into(),
             caddy_admin_api: "http://localhost:2019".into(),
             caddy_external_domain: std::env::var("CADDY_EXTERNAL_DOMAIN").unwrap_or_default(),
+            updates_dir: std::env::var("UPDATES_DIR")
+                .unwrap_or_else(|_| "/var/lib/meshlink/updates".into()),
+            scan_interval_secs: 30,
         })
     }
 
@@ -293,6 +334,8 @@ impl CoordServerConfig {
             caddy_config_path: file.caddy.config_path,
             caddy_admin_api: file.caddy.admin_api,
             caddy_external_domain: file.caddy.external_domain,
+            updates_dir: file.updates.dir,
+            scan_interval_secs: file.scanner.interval_secs,
         }
     }
 }
@@ -316,6 +359,22 @@ pub async fn run(config: CoordServerConfig) -> Result<()> {
     if config.admin_token.is_some() {
         info!("admin API enabled (ADMIN_TOKEN set)");
     }
+
+    // Initialize update store (creates directory if needed)
+    let update_store = update_store::UpdateStore::new(&config.updates_dir)
+        .context("initializing update store")?;
+    info!(dir = %config.updates_dir, "update store ready");
+
+    // Initialize service scanner shared state + SSE broadcast channel
+    let scan_state: scanner::ScanState = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+    let (sse_tx, _) = tokio::sync::broadcast::channel::<String>(32);
+    let scanner_db = database.clone();
+    let scanner_state = scan_state.clone();
+    let scanner_tx = sse_tx.clone();
+    let scan_interval = config.scan_interval_secs;
+    let scanner_task = tokio::spawn(async move {
+        scanner::run(scanner_db, scanner_state, scanner_tx, scan_interval).await;
+    });
 
     // Create shared UDP socket
     let udp_addr = format!("{}:{}", config.bind_address, config.udp_port);
@@ -362,6 +421,9 @@ pub async fn run(config: CoordServerConfig) -> Result<()> {
         config.caddy_config_path,
         config.caddy_admin_api,
         config.caddy_external_domain,
+        update_store,
+        scan_state,
+        sse_tx,
     ));
 
     // Start stale node checker with shared socket and peers for broadcasting
@@ -391,6 +453,7 @@ pub async fn run(config: CoordServerConfig) -> Result<()> {
     udp_server.abort();
     http_server.abort();
     stale_checker.abort();
+    scanner_task.abort();
 
     Ok(())
 }

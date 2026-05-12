@@ -6,6 +6,7 @@ mod credentials;
 mod crypto;
 mod discovery;
 mod net;
+mod peer_api;
 mod router;
 mod setup;
 mod state;
@@ -219,6 +220,18 @@ fn handle_down() -> Result<()> {
     Ok(())
 }
 
+async fn set_peer_status(
+    config: &coord::CoordServerConfig,
+    id: &str,
+    status: &str,
+    label: &str,
+) -> Result<()> {
+    let db = coord::db::Db::connect(&config.database_url).await?;
+    db.set_node_status(id, status).await?;
+    println!("Peer {id} {label}.");
+    coord::caddy::regen_from_db(&db, &config.caddy_config_path, &config.caddy_admin_api, &config.caddy_external_domain).await
+}
+
 /// Handle coordination server subcommands.
 async fn handle_cs_action(config_path: &std::path::Path, action: &cli::CsAction) -> Result<()> {
     let mut config = if config_path.exists() {
@@ -372,22 +385,10 @@ async fn handle_cs_action(config_path: &std::path::Path, action: &cli::CsAction)
             }
         }
         cli::CsAction::DisablePeer { id } => {
-            let db = coord::db::Db::connect(&config.database_url).await?;
-            db.set_node_status(id, "deregistered").await?;
-            println!("Peer {id} disabled.");
-            // Regen Caddy
-            let nodes = db.list_all_nodes().await?;
-            let content = coord::caddy::generate_caddyfile(&nodes, &config.caddy_external_domain);
-            coord::caddy::write_and_reload(&config.caddy_config_path, &config.caddy_admin_api, &content).await?;
+            set_peer_status(&config, id, "deregistered", "disabled").await?;
         }
         cli::CsAction::EnablePeer { id } => {
-            let db = coord::db::Db::connect(&config.database_url).await?;
-            db.set_node_status(id, "registered").await?;
-            println!("Peer {id} enabled.");
-            // Regen Caddy
-            let nodes = db.list_all_nodes().await?;
-            let content = coord::caddy::generate_caddyfile(&nodes, &config.caddy_external_domain);
-            coord::caddy::write_and_reload(&config.caddy_config_path, &config.caddy_admin_api, &content).await?;
+            set_peer_status(&config, id, "registered", "enabled").await?;
         }
         cli::CsAction::ListInvites => {
             let db = coord::db::Db::connect(&config.database_url).await?;
@@ -428,8 +429,7 @@ async fn handle_cs_action(config_path: &std::path::Path, action: &cli::CsAction)
             let db = coord::db::Db::connect(&config.database_url).await?;
             let nodes = db.list_all_nodes().await?;
             let content = coord::caddy::generate_caddyfile(&nodes, &config.caddy_external_domain);
-            println!("--- Generated Caddyfile ---");
-            print!("{content}");
+            println!("--- Generated Caddyfile ---\n{content}");
             coord::caddy::write_and_reload(&config.caddy_config_path, &config.caddy_admin_api, &content).await?;
             println!("Caddy config written to {} and reloaded.", config.caddy_config_path);
         }
@@ -533,6 +533,31 @@ async fn run_daemon(
             .copied()
             .context("no addresses for coordination server")?
     };
+
+    // Spawn peer API (optional, bound to the mesh virtual IP)
+    if config.peer_api.enabled {
+        let peer_api_config = config.peer_api.clone();
+        let peer_api_state = shared_state.clone();
+        let peer_api_vip = config.node.virtual_ip.addr();
+        let peer_api_creds = config_path
+            .parent()
+            .unwrap_or(std::path::Path::new("/etc/meshlink"))
+            .join("credentials.json");
+        let peer_api_coord = config.coordination.server.clone();
+        tokio::spawn(async move {
+            if let Err(e) = peer_api::run(
+                peer_api_config,
+                peer_api_state,
+                peer_api_vip,
+                peer_api_creds,
+                peer_api_coord,
+            )
+            .await
+            {
+                tracing::error!(error = %e, "peer API server stopped");
+            }
+        });
+    }
 
     info!("spawning async tasks");
 
