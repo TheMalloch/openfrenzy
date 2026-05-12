@@ -316,11 +316,12 @@ async fn handle_cs_action(config_path: &std::path::Path, action: &cli::CsAction)
             let db = coord::db::Db::connect(&config.database_url).await?;
             let code = uuid::Uuid::new_v4().to_string();
             let expires_at = chrono::Utc::now() + chrono::Duration::hours(*expires_hours);
-            let effective_max_uses = if *multi_use { *max_uses } else { 1 };
+            let is_multi = *multi_use || *max_uses != 1;
+            let effective_max_uses = if is_multi { *max_uses } else { 1 };
             db.create_invite(&code, expires_at, effective_max_uses).await?;
             println!("Invite code: {code}");
             println!("Expires at:  {}", expires_at.to_rfc3339());
-            if *multi_use {
+            if is_multi {
                 if effective_max_uses == 0 {
                     println!("Max uses:    unlimited");
                 } else {
