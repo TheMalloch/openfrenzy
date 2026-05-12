@@ -221,12 +221,24 @@ impl ServerParams {
 
 /// Default path for the runtime control unix socket.
 pub fn socket_path() -> PathBuf {
-    PathBuf::from("/var/run/meshlink.sock")
+    // Prefer /run/meshlink/ (created by systemd RuntimeDirectory=meshlink),
+    // fall back to /var/run for non-systemd invocations.
+    let preferred = PathBuf::from("/run/meshlink/meshlink.sock");
+    if preferred.parent().map(|p| p.exists()).unwrap_or(false) {
+        preferred
+    } else {
+        PathBuf::from("/var/run/meshlink.sock")
+    }
 }
 
 /// Default path for the PID file.
 pub fn pid_path() -> PathBuf {
-    PathBuf::from("/var/run/meshlink.pid")
+    let preferred = PathBuf::from("/run/meshlink/meshlink.pid");
+    if preferred.parent().map(|p| p.exists()).unwrap_or(false) {
+        preferred
+    } else {
+        PathBuf::from("/var/run/meshlink.pid")
+    }
 }
 
 /// Task: listen on a unix socket for runtime control commands.

@@ -3,6 +3,8 @@ Description=MeshLink Peer Node
 Documentation=file:///home/openfrenzy/readme.md
 After=network-online.target systemd-modules-load.service
 Wants=network-online.target
+StartLimitIntervalSec=120s
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -20,8 +22,10 @@ TimeoutStopSec=15s
 
 Restart=on-failure
 RestartSec=10s
-StartLimitIntervalSec=120s
-StartLimitBurst=5
+
+# CLI socket at /run/meshlink/meshlink.sock
+RuntimeDirectory=meshlink
+RuntimeDirectoryMode=0750
 
 StandardOutput=journal
 StandardError=journal
