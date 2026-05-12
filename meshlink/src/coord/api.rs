@@ -56,12 +56,12 @@ fn router(state: AppState) -> Router {
         .route("/api/v1/admin/invite", post(create_invite))
         // Admin peer endpoints
         .route("/api/v1/admin/peers", get(list_peers))
-        .route("/api/v1/admin/peers/:id", get(show_peer))
-        .route("/api/v1/admin/peers/:id/disable", post(disable_peer))
-        .route("/api/v1/admin/peers/:id/enable", post(enable_peer))
+        .route("/api/v1/admin/peers/{id}", get(show_peer))
+        .route("/api/v1/admin/peers/{id}/disable", post(disable_peer))
+        .route("/api/v1/admin/peers/{id}/enable", post(enable_peer))
         // Admin invite endpoints
         .route("/api/v1/admin/invites", get(list_invites))
-        .route("/api/v1/admin/invites/:code", delete(revoke_invite))
+        .route("/api/v1/admin/invites/{code}", delete(revoke_invite))
         // Peer token rotation (authenticated with current peer token)
         .route("/api/v1/node/token", patch(rotate_peer_token))
         // Update distribution (admin or peer token)
