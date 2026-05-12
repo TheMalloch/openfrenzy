@@ -440,6 +440,8 @@ async fn handle_keepalive(
     // Parse optional LAN IPs from extended keepalive (byte 33+)
     let lan_ip = parse_lan_ips(data, 33);
 
+    let mut should_broadcast = false;
+
     {
         let mut map = peers.lock().await;
         if let Some(peer) = map.get_mut(&public_key) {
@@ -468,9 +470,12 @@ async fn handle_keepalive(
                 },
             );
             info!(%src, "re-registered peer from keepalive");
-            // Peer came back — broadcast updated peer list so all peers learn each other
-            broadcast_peer_list(socket, peers, database).await;
+            should_broadcast = true;
         }
+    }
+
+    if should_broadcast {
+        broadcast_peer_list(socket, peers, database).await;
     }
 
     // Persist endpoint to database
