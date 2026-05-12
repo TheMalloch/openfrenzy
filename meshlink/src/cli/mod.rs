@@ -254,7 +254,7 @@ pub async fn cli_listener_task(state: SharedState) {
             l
         }
         Err(e) => {
-            error!(error = %e, "failed to bind CLI socket");
+            tracing::warn!(error = %e, path = %sock_path.display(), "CLI socket unavailable, runtime control disabled");
             return;
         }
     };

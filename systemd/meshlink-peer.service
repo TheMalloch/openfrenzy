@@ -14,7 +14,6 @@ Group=meshlink
 # Config is read from /etc/meshlink/config.toml (written by `meshlink up --invite`).
 # Credentials are read from /etc/meshlink/credentials.json.
 ExecStart=/usr/local/bin/meshlink up --foreground
-ExecStop=/usr/local/bin/meshlink down
 
 # Peer daemon handles SIGTERM natively
 KillSignal=SIGTERM
