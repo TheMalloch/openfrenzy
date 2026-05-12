@@ -265,7 +265,7 @@ async fn handle_message(
             handle_peer_list_req(socket, peers, database, data, src).await;
         }
         proto::KEEPALIVE => {
-            handle_keepalive(peers, database, data, src).await;
+            handle_keepalive(socket, peers, database, data, src).await;
         }
         t => {
             debug!(msg_type = t, %src, "unknown message type");
@@ -424,6 +424,7 @@ async fn handle_peer_list_req(
 }
 
 async fn handle_keepalive(
+    socket: &UdpSocket,
     peers: &PeerMap,
     database: &db::Db,
     data: &[u8],
@@ -467,6 +468,8 @@ async fn handle_keepalive(
                 },
             );
             info!(%src, "re-registered peer from keepalive");
+            // Peer came back — broadcast updated peer list so all peers learn each other
+            broadcast_peer_list(socket, peers, database).await;
         }
     }
 
