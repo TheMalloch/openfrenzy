@@ -274,8 +274,15 @@ impl CoordServerConfig {
             .context("parsing UDP_PORT")?;
         let admin_token = std::env::var("ADMIN_TOKEN").ok();
         let bind_address = std::env::var("BIND_ADDRESS").unwrap_or_else(|_| "[::]".into());
+        let external_address = std::env::var("EXTERNAL_ADDRESS").unwrap_or_default();
         let coord_server_addr = std::env::var("COORD_SERVER_ADDR")
-            .unwrap_or_else(|_| format!("0.0.0.0:{udp_port}"));
+            .unwrap_or_else(|_| {
+                if external_address.is_empty() {
+                    format!("0.0.0.0:{udp_port}")
+                } else {
+                    format!("{external_address}:{udp_port}")
+                }
+            });
 
         Ok(Self {
             database_url,
@@ -283,7 +290,7 @@ impl CoordServerConfig {
             http_port,
             udp_port,
             bind_address,
-            external_address: std::env::var("EXTERNAL_ADDRESS").unwrap_or_default(),
+            external_address,
             tls_cert: std::env::var("TLS_CERT").ok(),
             tls_key: std::env::var("TLS_KEY").ok(),
             admin_token,
