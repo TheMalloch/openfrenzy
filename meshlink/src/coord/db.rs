@@ -379,7 +379,7 @@ impl Db {
     /// Get all virtual IPs currently allocated to active/registered nodes.
     pub async fn allocated_ips(&self) -> Result<Vec<String>> {
         let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT virtual_ip FROM nodes WHERE status IN ('registered', 'active')",
+            "SELECT virtual_ip FROM nodes WHERE status != 'deregistered'",
         )
         .fetch_all(&self.pool)
         .await
