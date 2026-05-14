@@ -1,7 +1,6 @@
 mod api_client;
 mod cli;
 mod config;
-mod coord;
 mod credentials;
 mod crypto;
 mod discovery;
@@ -90,13 +89,6 @@ fn main() -> Result<()> {
             println!("  Node ID:      {}", resp.node_id);
             println!("  Virtual IP:   {}", resp.virtual_ip);
             println!("  Public Key:   {}", resp.public_key);
-            if resp.port_range_size > 0 {
-                println!(
-                    "  Port Range:   {}-{}",
-                    resp.port_range_start,
-                    resp.port_range_start + resp.port_range_size - 1
-                );
-            }
             println!();
             Ok::<(), anyhow::Error>(())
         })?;
@@ -157,9 +149,6 @@ fn main() -> Result<()> {
                 let resp = cli::send_command("peers").await?;
                 print!("{resp}");
             }
-            Some(Command::Cs { config, action }) => {
-                return handle_cs_action(config, action).await;
-            }
             Some(Command::Up { foreground, .. }) => {
                 run_daemon(&cli.config, coord_server_override, *foreground).await?;
             }
@@ -214,194 +203,6 @@ fn handle_down() -> Result<()> {
             // Process is gone, clean up stale PID file
             let _ = std::fs::remove_file(&pid_path);
             println!("MeshLink stopped.");
-        }
-    }
-
-    Ok(())
-}
-
-async fn set_peer_status(
-    config: &coord::CoordServerConfig,
-    id: &str,
-    status: &str,
-    label: &str,
-) -> Result<()> {
-    let db = coord::db::Db::connect(&config.database_path).await?;
-    db.set_node_status(id, status).await?;
-    println!("Peer {id} {label}.");
-    Ok(())
-}
-
-/// Handle coordination server subcommands.
-async fn handle_cs_action(config_path: &std::path::Path, action: &cli::CsAction) -> Result<()> {
-    let mut config = if config_path.exists() {
-        info!(path = %config_path.display(), "loading coord config from file");
-        coord::CoordServerConfig::load(config_path)?
-    } else {
-        info!("coord config file not found, falling back to environment variables");
-        coord::CoordServerConfig::from_env()?
-    };
-
-    match action {
-        cli::CsAction::Start {
-            database_path,
-            mesh_cidr,
-            http_port,
-            udp_port,
-            bind_address,
-            external_address,
-            admin_token,
-            stale_timeout_secs,
-            cleanup_interval_secs,
-            max_peers,
-            default_listen_port,
-            default_expiry_hours,
-            default_max_uses,
-            log_level,
-        } => {
-            if let Some(v) = database_path { config.database_path = v.clone(); }
-            if let Some(v) = mesh_cidr { config.mesh_network = v.clone(); }
-            if let Some(v) = http_port { config.http_port = *v; }
-            if let Some(v) = udp_port { config.udp_port = *v; }
-            if let Some(v) = bind_address { config.bind_address = v.clone(); }
-            if let Some(v) = external_address { config.external_address = v.clone(); }
-            if let Some(v) = admin_token { config.admin_token = Some(v.clone()); }
-            if let Some(v) = stale_timeout_secs { config.stale_timeout_secs = *v; }
-            if let Some(v) = cleanup_interval_secs { config.cleanup_interval_secs = *v; }
-            if let Some(v) = max_peers { config.max_peers = *v; }
-            if let Some(v) = default_listen_port { config.default_listen_port = *v; }
-            if let Some(v) = default_expiry_hours { config.default_expiry_hours = *v; }
-            if let Some(v) = default_max_uses { config.default_max_uses = *v; }
-            if let Some(v) = log_level { config.log_level = v.clone(); }
-            coord::run(config).await?;
-        }
-        cli::CsAction::DbSetup => {
-            let db = coord::db::Db::connect(&config.database_path).await?;
-            db.setup_tables().await?;
-            println!("Database tables created.");
-        }
-        cli::CsAction::DbWipe => {
-            let db = coord::db::Db::connect(&config.database_path).await?;
-            db.drop_all_tables().await?;
-            println!("All tables dropped.");
-        }
-        cli::CsAction::KeyGen => {
-            let (private_key, public_key) = coord::key_manager::generate_node_keypair();
-            let priv_b64 = base64::Engine::encode(
-                &base64::engine::general_purpose::STANDARD,
-                private_key,
-            );
-            let pub_b64 = base64::Engine::encode(
-                &base64::engine::general_purpose::STANDARD,
-                public_key,
-            );
-            println!("Private key: {priv_b64}");
-            println!("Public key:  {pub_b64}");
-        }
-        cli::CsAction::CreateInvite { multi_use, max_uses, expires_hours } => {
-            let db = coord::db::Db::connect(&config.database_path).await?;
-            let code = uuid::Uuid::new_v4().to_string();
-            let expires_at = chrono::Utc::now() + chrono::Duration::hours(*expires_hours);
-            let is_multi = *multi_use || *max_uses != 1;
-            let effective_max_uses = if is_multi { *max_uses } else { 1 };
-            db.create_invite(&code, expires_at, effective_max_uses).await?;
-            println!("Invite code: {code}");
-            println!("Expires at:  {}", expires_at.to_rfc3339());
-            if is_multi {
-                if effective_max_uses == 0 {
-                    println!("Max uses:    unlimited");
-                } else {
-                    println!("Max uses:    {effective_max_uses}");
-                }
-            } else {
-                println!("Max uses:    1 (single-use)");
-            }
-        }
-        cli::CsAction::ListPeers => {
-            let db = coord::db::Db::connect(&config.database_path).await?;
-            let nodes = db.list_all_nodes().await?;
-            if nodes.is_empty() {
-                println!("No peers registered.");
-            } else {
-                println!(
-                    "{:<38} {:<16} {:<16} {:<15} {:<20}",
-                    "NODE ID", "NAME", "VIRTUAL IP", "STATUS", "LAST SEEN"
-                );
-                println!("{}", "-".repeat(108));
-                for n in &nodes {
-                    let name = n.node_name.as_deref().unwrap_or("-");
-                    let vip = n.virtual_ip.split('/').next().unwrap_or(&n.virtual_ip);
-                    let last_seen = n
-                        .last_heartbeat
-                        .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
-                        .unwrap_or_else(|| "-".to_string());
-                    println!(
-                        "{:<38} {:<16} {:<16} {:<15} {:<20}",
-                        n.node_id, name, vip, n.status, last_seen
-                    );
-                }
-            }
-        }
-        cli::CsAction::ShowPeer { id } => {
-            let db = coord::db::Db::connect(&config.database_path).await?;
-            match db.get_node(id).await? {
-                None => println!("Peer not found: {id}"),
-                Some(n) => {
-                    let vip = n.virtual_ip.split('/').next().unwrap_or(&n.virtual_ip);
-                    println!("Node ID:        {}", n.node_id);
-                    println!("Name:           {}", n.node_name.as_deref().unwrap_or("-"));
-                    println!("Virtual IP:     {vip}");
-                    println!("Status:         {}", n.status);
-                    println!("Endpoint:       {}", n.endpoint.as_deref().unwrap_or("-"));
-                    println!("IPv6 endpoint:  {}", n.ipv6_endpoint.as_deref().unwrap_or("-"));
-                    println!("LAN endpoint:   {}", n.lan_endpoint.as_deref().unwrap_or("-"));
-                    println!("Listen port:    {}", n.listen_port);
-                    println!("Last heartbeat: {}", n.last_heartbeat.map(|t| t.to_rfc3339()).unwrap_or_else(|| "-".to_string()));
-                    println!("Created at:     {}", n.created_at.to_rfc3339());
-                    println!("Updated at:     {}", n.updated_at.to_rfc3339());
-                }
-            }
-        }
-        cli::CsAction::DisablePeer { id } => {
-            set_peer_status(&config, id, "deregistered", "disabled").await?;
-        }
-        cli::CsAction::EnablePeer { id } => {
-            set_peer_status(&config, id, "registered", "enabled").await?;
-        }
-        cli::CsAction::ListInvites => {
-            let db = coord::db::Db::connect(&config.database_path).await?;
-            let invites = db.list_all_invites().await?;
-            if invites.is_empty() {
-                println!("No invites.");
-            } else {
-                println!(
-                    "{:<38} {:<6} {:<6} {:<32} {:<8}",
-                    "CODE", "USES", "MAX", "EXPIRES", "STATUS"
-                );
-                println!("{}", "-".repeat(95));
-                for inv in &invites {
-                    let expired = inv.expires_at < chrono::Utc::now();
-                    let exhausted = inv.max_uses > 0 && inv.use_count >= inv.max_uses;
-                    let status = if exhausted { "exhausted" } else if expired { "expired" } else { "active" };
-                    let max_str = if inv.max_uses == 0 { "∞".to_string() } else { inv.max_uses.to_string() };
-                    println!(
-                        "{:<38} {:<6} {:<6} {:<32} {:<8}",
-                        inv.code,
-                        inv.use_count,
-                        max_str,
-                        inv.expires_at.format("%Y-%m-%d %H:%M:%S UTC"),
-                        status
-                    );
-                }
-            }
-        }
-        cli::CsAction::RevokeInvite { code } => {
-            let db = coord::db::Db::connect(&config.database_path).await?;
-            if db.revoke_invite(code).await? {
-                println!("Invite {code} revoked.");
-            } else {
-                println!("Invite not found: {code}");
-            }
         }
     }
 

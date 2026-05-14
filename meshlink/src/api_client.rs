@@ -10,10 +10,6 @@ pub struct RegistrationResponse {
     pub virtual_ip: String,
     pub config_toml: String,
     pub auth_token: String,
-    #[serde(default)]
-    pub port_range_start: u16,
-    #[serde(default)]
-    pub port_range_size: u16,
 }
 
 /// HTTP client for the MeshLink coordination server REST API.
