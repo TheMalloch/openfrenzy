@@ -226,10 +226,10 @@ async fn set_peer_status(
     status: &str,
     label: &str,
 ) -> Result<()> {
-    let db = coord::db::Db::connect(&config.database_url).await?;
+    let db = coord::db::Db::connect(&config.database_path).await?;
     db.set_node_status(id, status).await?;
     println!("Peer {id} {label}.");
-    coord::caddy::regen_from_db(&db, &config.caddy_config_path, &config.caddy_admin_api, &config.caddy_external_domain).await
+    Ok(())
 }
 
 /// Handle coordination server subcommands.
@@ -244,14 +244,12 @@ async fn handle_cs_action(config_path: &std::path::Path, action: &cli::CsAction)
 
     match action {
         cli::CsAction::Start {
-            database_url,
+            database_path,
             mesh_cidr,
             http_port,
             udp_port,
             bind_address,
             external_address,
-            tls_cert,
-            tls_key,
             admin_token,
             stale_timeout_secs,
             cleanup_interval_secs,
@@ -260,20 +258,13 @@ async fn handle_cs_action(config_path: &std::path::Path, action: &cli::CsAction)
             default_expiry_hours,
             default_max_uses,
             log_level,
-            port_range_base,
-            port_range_block_size,
-            caddy_config_path,
-            caddy_admin_api,
-            caddy_external_domain,
         } => {
-            if let Some(v) = database_url { config.database_url = v.clone(); }
+            if let Some(v) = database_path { config.database_path = v.clone(); }
             if let Some(v) = mesh_cidr { config.mesh_network = v.clone(); }
             if let Some(v) = http_port { config.http_port = *v; }
             if let Some(v) = udp_port { config.udp_port = *v; }
             if let Some(v) = bind_address { config.bind_address = v.clone(); }
             if let Some(v) = external_address { config.external_address = v.clone(); }
-            if let Some(v) = tls_cert { config.tls_cert = Some(v.clone()); }
-            if let Some(v) = tls_key { config.tls_key = Some(v.clone()); }
             if let Some(v) = admin_token { config.admin_token = Some(v.clone()); }
             if let Some(v) = stale_timeout_secs { config.stale_timeout_secs = *v; }
             if let Some(v) = cleanup_interval_secs { config.cleanup_interval_secs = *v; }
@@ -282,20 +273,15 @@ async fn handle_cs_action(config_path: &std::path::Path, action: &cli::CsAction)
             if let Some(v) = default_expiry_hours { config.default_expiry_hours = *v; }
             if let Some(v) = default_max_uses { config.default_max_uses = *v; }
             if let Some(v) = log_level { config.log_level = v.clone(); }
-            if let Some(v) = port_range_base { config.port_range_base = *v; }
-            if let Some(v) = port_range_block_size { config.port_range_block_size = *v; }
-            if let Some(v) = caddy_config_path { config.caddy_config_path = v.clone(); }
-            if let Some(v) = caddy_admin_api { config.caddy_admin_api = v.clone(); }
-            if let Some(v) = caddy_external_domain { config.caddy_external_domain = v.clone(); }
             coord::run(config).await?;
         }
         cli::CsAction::DbSetup => {
-            let db = coord::db::Db::connect(&config.database_url).await?;
+            let db = coord::db::Db::connect(&config.database_path).await?;
             db.setup_tables().await?;
             println!("Database tables created.");
         }
         cli::CsAction::DbWipe => {
-            let db = coord::db::Db::connect(&config.database_url).await?;
+            let db = coord::db::Db::connect(&config.database_path).await?;
             db.drop_all_tables().await?;
             println!("All tables dropped.");
         }
@@ -313,7 +299,7 @@ async fn handle_cs_action(config_path: &std::path::Path, action: &cli::CsAction)
             println!("Public key:  {pub_b64}");
         }
         cli::CsAction::CreateInvite { multi_use, max_uses, expires_hours } => {
-            let db = coord::db::Db::connect(&config.database_url).await?;
+            let db = coord::db::Db::connect(&config.database_path).await?;
             let code = uuid::Uuid::new_v4().to_string();
             let expires_at = chrono::Utc::now() + chrono::Duration::hours(*expires_hours);
             let is_multi = *multi_use || *max_uses != 1;
@@ -332,49 +318,40 @@ async fn handle_cs_action(config_path: &std::path::Path, action: &cli::CsAction)
             }
         }
         cli::CsAction::ListPeers => {
-            let db = coord::db::Db::connect(&config.database_url).await?;
+            let db = coord::db::Db::connect(&config.database_path).await?;
             let nodes = db.list_all_nodes().await?;
             if nodes.is_empty() {
                 println!("No peers registered.");
             } else {
                 println!(
-                    "{:<38} {:<16} {:<16} {:<15} {:<13} {:<20}",
-                    "NODE ID", "NAME", "VIRTUAL IP", "STATUS", "PORT RANGE", "LAST SEEN"
+                    "{:<38} {:<16} {:<16} {:<15} {:<20}",
+                    "NODE ID", "NAME", "VIRTUAL IP", "STATUS", "LAST SEEN"
                 );
-                println!("{}", "-".repeat(120));
+                println!("{}", "-".repeat(108));
                 for n in &nodes {
                     let name = n.node_name.as_deref().unwrap_or("-");
                     let vip = n.virtual_ip.split('/').next().unwrap_or(&n.virtual_ip);
-                    let port_range = match (n.port_range_start, n.port_range_size) {
-                        (Some(s), Some(z)) => format!("{}-{}", s, s + z - 1),
-                        _ => "-".to_string(),
-                    };
                     let last_seen = n
                         .last_heartbeat
                         .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
                         .unwrap_or_else(|| "-".to_string());
                     println!(
-                        "{:<38} {:<16} {:<16} {:<15} {:<13} {:<20}",
-                        n.node_id, name, vip, n.status, port_range, last_seen
+                        "{:<38} {:<16} {:<16} {:<15} {:<20}",
+                        n.node_id, name, vip, n.status, last_seen
                     );
                 }
             }
         }
         cli::CsAction::ShowPeer { id } => {
-            let db = coord::db::Db::connect(&config.database_url).await?;
+            let db = coord::db::Db::connect(&config.database_path).await?;
             match db.get_node(id).await? {
                 None => println!("Peer not found: {id}"),
                 Some(n) => {
                     let vip = n.virtual_ip.split('/').next().unwrap_or(&n.virtual_ip);
-                    let port_range = match (n.port_range_start, n.port_range_size) {
-                        (Some(s), Some(z)) => format!("{}-{}", s, s + z - 1),
-                        _ => "-".to_string(),
-                    };
                     println!("Node ID:        {}", n.node_id);
                     println!("Name:           {}", n.node_name.as_deref().unwrap_or("-"));
                     println!("Virtual IP:     {vip}");
                     println!("Status:         {}", n.status);
-                    println!("Port range:     {port_range}");
                     println!("Endpoint:       {}", n.endpoint.as_deref().unwrap_or("-"));
                     println!("IPv6 endpoint:  {}", n.ipv6_endpoint.as_deref().unwrap_or("-"));
                     println!("LAN endpoint:   {}", n.lan_endpoint.as_deref().unwrap_or("-"));
@@ -392,7 +369,7 @@ async fn handle_cs_action(config_path: &std::path::Path, action: &cli::CsAction)
             set_peer_status(&config, id, "registered", "enabled").await?;
         }
         cli::CsAction::ListInvites => {
-            let db = coord::db::Db::connect(&config.database_url).await?;
+            let db = coord::db::Db::connect(&config.database_path).await?;
             let invites = db.list_all_invites().await?;
             if invites.is_empty() {
                 println!("No invites.");
@@ -419,20 +396,12 @@ async fn handle_cs_action(config_path: &std::path::Path, action: &cli::CsAction)
             }
         }
         cli::CsAction::RevokeInvite { code } => {
-            let db = coord::db::Db::connect(&config.database_url).await?;
+            let db = coord::db::Db::connect(&config.database_path).await?;
             if db.revoke_invite(code).await? {
                 println!("Invite {code} revoked.");
             } else {
                 println!("Invite not found: {code}");
             }
-        }
-        cli::CsAction::CaddyRegen => {
-            let db = coord::db::Db::connect(&config.database_url).await?;
-            let nodes = db.list_all_nodes().await?;
-            let content = coord::caddy::generate_caddyfile(&nodes, &config.caddy_external_domain);
-            println!("--- Generated Caddyfile ---\n{content}");
-            coord::caddy::write_and_reload(&config.caddy_config_path, &config.caddy_admin_api, &content).await?;
-            println!("Caddy config written to {} and reloaded.", config.caddy_config_path);
         }
     }
 

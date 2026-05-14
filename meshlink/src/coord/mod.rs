@@ -1,12 +1,8 @@
-pub mod admin_html;
 pub mod api;
-pub mod caddy;
 pub mod config_generator;
 pub mod db;
 pub mod ip_allocator;
 pub mod key_manager;
-pub mod port_allocator;
-pub mod scanner;
 pub mod udp_handler;
 pub mod update_store;
 
@@ -21,14 +17,12 @@ use tracing::info;
 
 /// Configuration for the coordination server (runtime, flattened).
 pub struct CoordServerConfig {
-    pub database_url: String,
+    pub database_path: String,
     pub mesh_network: String,
     pub http_port: u16,
     pub udp_port: u16,
     pub bind_address: String,
     pub external_address: String,
-    pub tls_cert: Option<String>,
-    pub tls_key: Option<String>,
     pub admin_token: Option<String>,
     pub coord_server_addr: String,
     pub stale_timeout_secs: u64,
@@ -38,17 +32,8 @@ pub struct CoordServerConfig {
     pub default_expiry_hours: i64,
     pub default_max_uses: i32,
     pub log_level: String,
-    // Port range allocation
-    pub port_range_base: u16,
-    pub port_range_block_size: u16,
-    // Caddy integration
-    pub caddy_config_path: String,
-    pub caddy_admin_api: String,
-    pub caddy_external_domain: String,
     // Update distribution
     pub updates_dir: String,
-    // Service scanner
-    pub scan_interval_secs: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -68,25 +53,19 @@ pub struct CoordConfigFile {
     #[serde(default)]
     pub logging: LoggingConfig,
     #[serde(default)]
-    pub ports: PortsConfig,
-    #[serde(default)]
-    pub caddy: CaddyConfig,
-    #[serde(default)]
     pub updates: UpdatesConfig,
-    #[serde(default)]
-    pub scanner: ScannerConfig,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct DatabaseConfig {
-    pub url: String,
+    pub path: String,
 }
 
 impl Default for DatabaseConfig {
     fn default() -> Self {
         Self {
-            url: "postgres:///meshlink?user=meshlink".into(),
+            path: "/var/lib/meshlink/coord.db".into(),
         }
     }
 }
@@ -113,8 +92,6 @@ pub struct ServerConfig {
     pub coord_addr: Option<String>,
     pub bind_address: String,
     pub external_address: String,
-    pub tls_cert: Option<String>,
-    pub tls_key: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -125,8 +102,6 @@ impl Default for ServerConfig {
             coord_addr: None,
             bind_address: "[::]".into(),
             external_address: String::new(),
-            tls_cert: None,
-            tls_key: None,
         }
     }
 }
@@ -189,40 +164,6 @@ impl Default for LoggingConfig {
 
 #[derive(Debug, Deserialize)]
 #[serde(default)]
-pub struct PortsConfig {
-    pub range_base: u16,
-    pub block_size: u16,
-}
-
-impl Default for PortsConfig {
-    fn default() -> Self {
-        Self {
-            range_base: 9000,
-            block_size: 100,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-pub struct CaddyConfig {
-    pub config_path: String,
-    pub admin_api: String,
-    pub external_domain: String,
-}
-
-impl Default for CaddyConfig {
-    fn default() -> Self {
-        Self {
-            config_path: "/etc/caddy/meshlink.conf".into(),
-            admin_api: "http://localhost:2019".into(),
-            external_domain: String::new(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
 pub struct UpdatesConfig {
     pub dir: String,
 }
@@ -232,19 +173,6 @@ impl Default for UpdatesConfig {
         Self {
             dir: "/var/lib/meshlink/updates".into(),
         }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-pub struct ScannerConfig {
-    /// Seconds between TCP port scans of all active peers.
-    pub interval_secs: u64,
-}
-
-impl Default for ScannerConfig {
-    fn default() -> Self {
-        Self { interval_secs: 30 }
     }
 }
 
@@ -260,8 +188,8 @@ impl CoordServerConfig {
 
     /// Load configuration from environment variables with sensible defaults.
     pub fn from_env() -> Result<Self> {
-        let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres:///meshlink?user=meshlink".into());
+        let database_path = std::env::var("DATABASE_PATH")
+            .unwrap_or_else(|_| "/var/lib/meshlink/coord.db".into());
         let mesh_network =
             std::env::var("MESH_NETWORK").unwrap_or_else(|_| "10.0.0.0/24".into());
         let http_port: u16 = std::env::var("HTTP_PORT")
@@ -285,14 +213,12 @@ impl CoordServerConfig {
             });
 
         Ok(Self {
-            database_url,
+            database_path,
             mesh_network,
             http_port,
             udp_port,
             bind_address,
             external_address,
-            tls_cert: std::env::var("TLS_CERT").ok(),
-            tls_key: std::env::var("TLS_KEY").ok(),
             admin_token,
             coord_server_addr,
             stale_timeout_secs: 120,
@@ -302,14 +228,8 @@ impl CoordServerConfig {
             default_expiry_hours: 24,
             default_max_uses: 1,
             log_level: std::env::var("LOG_LEVEL").unwrap_or_else(|_| "info".into()),
-            port_range_base: 9000,
-            port_range_block_size: 100,
-            caddy_config_path: "/etc/caddy/meshlink.conf".into(),
-            caddy_admin_api: "http://localhost:2019".into(),
-            caddy_external_domain: std::env::var("CADDY_EXTERNAL_DOMAIN").unwrap_or_default(),
             updates_dir: std::env::var("UPDATES_DIR")
                 .unwrap_or_else(|_| "/var/lib/meshlink/updates".into()),
-            scan_interval_secs: 30,
         })
     }
 
@@ -319,14 +239,12 @@ impl CoordServerConfig {
             .coord_addr
             .unwrap_or_else(|| format!("0.0.0.0:{}", file.server.udp_port));
         Self {
-            database_url: file.database.url,
+            database_path: file.database.path,
             mesh_network: file.network.mesh_cidr,
             http_port: file.server.http_port,
             udp_port: file.server.udp_port,
             bind_address: file.server.bind_address,
             external_address: file.server.external_address,
-            tls_cert: file.server.tls_cert,
-            tls_key: file.server.tls_key,
             admin_token: file.admin.token,
             coord_server_addr,
             stale_timeout_secs: file.peers.stale_timeout_secs,
@@ -336,32 +254,20 @@ impl CoordServerConfig {
             default_expiry_hours: file.invites.default_expiry_hours,
             default_max_uses: file.invites.default_max_uses,
             log_level: file.logging.level,
-            port_range_base: file.ports.range_base,
-            port_range_block_size: file.ports.block_size,
-            caddy_config_path: file.caddy.config_path,
-            caddy_admin_api: file.caddy.admin_api,
-            caddy_external_domain: file.caddy.external_domain,
             updates_dir: file.updates.dir,
-            scan_interval_secs: file.scanner.interval_secs,
         }
     }
 }
 
 /// Start the coordination server (UDP + HTTP + stale node checker).
 pub async fn run(config: CoordServerConfig) -> Result<()> {
-    // Connect to PostgreSQL and run migrations
-    let database = db::Db::connect(&config.database_url).await?;
+    // Connect to SQLite and run migrations
+    let database = db::Db::connect(&config.database_path).await?;
     database.setup_tables().await?;
 
     // Set up IP allocator
     let ip_allocator = ip_allocator::IpAllocator::new(&config.mesh_network)
         .context("initializing IP allocator")?;
-
-    // Set up port allocator
-    let port_allocator = port_allocator::PortAllocator::new(
-        config.port_range_base,
-        config.port_range_block_size,
-    );
 
     if config.admin_token.is_some() {
         info!("admin API enabled (ADMIN_TOKEN set)");
@@ -371,17 +277,6 @@ pub async fn run(config: CoordServerConfig) -> Result<()> {
     let update_store = update_store::UpdateStore::new(&config.updates_dir)
         .context("initializing update store")?;
     info!(dir = %config.updates_dir, "update store ready");
-
-    // Initialize service scanner shared state + SSE broadcast channel
-    let scan_state: scanner::ScanState = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
-    let (sse_tx, _) = tokio::sync::broadcast::channel::<String>(32);
-    let scanner_db = database.clone();
-    let scanner_state = scan_state.clone();
-    let scanner_tx = sse_tx.clone();
-    let scan_interval = config.scan_interval_secs;
-    let scanner_task = tokio::spawn(async move {
-        scanner::run(scanner_db, scanner_state, scanner_tx, scan_interval).await;
-    });
 
     // Create shared UDP socket
     let udp_addr = format!("{}:{}", config.bind_address, config.udp_port);
@@ -417,20 +312,10 @@ pub async fn run(config: CoordServerConfig) -> Result<()> {
         config.bind_address.clone(),
         http_db,
         ip_allocator,
-        port_allocator,
         config.coord_server_addr,
         config.admin_token,
         config.default_listen_port,
-        config.default_expiry_hours,
-        config.default_max_uses,
-        udp_socket.clone(),
-        peers.clone(),
-        config.caddy_config_path,
-        config.caddy_admin_api,
-        config.caddy_external_domain,
         update_store,
-        scan_state,
-        sse_tx,
     ));
 
     // Start stale node checker with shared socket and peers for broadcasting
@@ -460,7 +345,6 @@ pub async fn run(config: CoordServerConfig) -> Result<()> {
     udp_server.abort();
     http_server.abort();
     stale_checker.abort();
-    scanner_task.abort();
 
     Ok(())
 }

@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
+use sqlx::SqlitePool;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
+use std::str::FromStr;
 use tracing::info;
 
 /// A node record from the database.
@@ -21,8 +23,6 @@ pub struct NodeRecord {
     pub last_heartbeat: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    pub port_range_start: Option<i32>,
-    pub port_range_size: Option<i32>,
 }
 
 /// An invite record from the database.
@@ -48,112 +48,105 @@ pub struct UpdateRecord {
     pub uploaded_at: DateTime<Utc>,
 }
 
-/// Database handle wrapping a PostgreSQL connection pool.
+/// Database handle wrapping a SQLite connection pool.
 #[derive(Clone)]
 pub struct Db {
-    pub pool: PgPool,
+    pub pool: SqlitePool,
 }
 
 impl Db {
-    /// Connect to the database and return a Db handle.
-    pub async fn connect(database_url: &str) -> Result<Self> {
-        let pool = PgPool::connect(database_url)
+    /// Connect to the SQLite database file and return a Db handle.
+    /// Accepts a plain file path (e.g. `/var/lib/meshlink/coord.db`) or a
+    /// `sqlite://…` URL.
+    pub async fn connect(database_path: &str) -> Result<Self> {
+        let url = if database_path.starts_with("sqlite:") {
+            database_path.to_string()
+        } else {
+            format!("sqlite://{database_path}")
+        };
+
+        let opts = SqliteConnectOptions::from_str(&url)
+            .context("parsing SQLite connection string")?
+            .create_if_missing(true)
+            .foreign_keys(true)
+            .journal_mode(SqliteJournalMode::Wal);
+
+        let pool = SqlitePool::connect_with(opts)
             .await
-            .context("connecting to PostgreSQL")?;
-        info!("connected to PostgreSQL");
+            .context("connecting to SQLite")?;
+        info!("connected to SQLite at {database_path}");
         Ok(Self { pool })
     }
 
     /// Create all required tables (idempotent).
     pub async fn setup_tables(&self) -> Result<()> {
         sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS nodes (
+            "CREATE TABLE IF NOT EXISTS nodes (
                 node_id TEXT PRIMARY KEY,
                 node_name TEXT,
-                public_key BYTEA NOT NULL UNIQUE,
-                private_key_encrypted BYTEA NOT NULL,
+                public_key BLOB NOT NULL UNIQUE,
+                private_key_encrypted BLOB NOT NULL,
                 virtual_ip TEXT NOT NULL UNIQUE,
                 auth_token TEXT NOT NULL UNIQUE,
                 status TEXT NOT NULL DEFAULT 'registered'
                     CHECK(status IN ('registered','active','stale','deregistered')),
                 endpoint TEXT,
                 ipv6_endpoint TEXT,
+                lan_endpoint TEXT,
                 listen_port INTEGER NOT NULL DEFAULT 51820,
-                last_heartbeat TIMESTAMPTZ,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )"#,
+                last_heartbeat TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )",
         )
         .execute(&self.pool)
         .await
         .context("creating nodes table")?;
 
         sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS invites (
+            "CREATE TABLE IF NOT EXISTS invites (
                 code TEXT PRIMARY KEY,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                expires_at TIMESTAMPTZ NOT NULL,
-                used_at TIMESTAMPTZ,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                expires_at TEXT NOT NULL,
+                used_at TEXT,
                 used_by_node_id TEXT REFERENCES nodes(node_id),
                 max_uses INTEGER NOT NULL DEFAULT 1,
                 use_count INTEGER NOT NULL DEFAULT 0
-            )"#,
+            )",
         )
         .execute(&self.pool)
         .await
         .context("creating invites table")?;
 
-        // Migrate existing tables: add columns if missing
-        sqlx::query("ALTER TABLE invites ADD COLUMN IF NOT EXISTS max_uses INTEGER NOT NULL DEFAULT 1")
-            .execute(&self.pool)
-            .await
-            .context("migrating invites: max_uses")?;
-        sqlx::query("ALTER TABLE invites ADD COLUMN IF NOT EXISTS use_count INTEGER NOT NULL DEFAULT 0")
-            .execute(&self.pool)
-            .await
-            .context("migrating invites: use_count")?;
-        sqlx::query("ALTER TABLE nodes ADD COLUMN IF NOT EXISTS ipv6_endpoint TEXT")
-            .execute(&self.pool)
-            .await
-            .context("migrating nodes: ipv6_endpoint")?;
-        sqlx::query("ALTER TABLE nodes ADD COLUMN IF NOT EXISTS lan_endpoint TEXT")
-            .execute(&self.pool)
-            .await
-            .context("migrating nodes: lan_endpoint")?;
-        sqlx::query("ALTER TABLE nodes ADD COLUMN IF NOT EXISTS port_range_start INTEGER")
-            .execute(&self.pool)
-            .await
-            .context("migrating nodes: port_range_start")?;
-        sqlx::query("ALTER TABLE nodes ADD COLUMN IF NOT EXISTS port_range_size INTEGER")
-            .execute(&self.pool)
-            .await
-            .context("migrating nodes: port_range_size")?;
-
         sqlx::query(
-            r#"CREATE TABLE IF NOT EXISTS updates (
-                id BIGSERIAL PRIMARY KEY,
+            "CREATE TABLE IF NOT EXISTS updates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 description TEXT NOT NULL,
                 binary_hash TEXT NOT NULL,
-                binary_size BIGINT NOT NULL,
+                binary_size INTEGER NOT NULL,
                 uploaded_by TEXT NOT NULL,
-                uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )"#,
+                uploaded_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )",
         )
         .execute(&self.pool)
         .await
         .context("creating updates table")?;
 
-        info!("database tables created");
+        info!("database tables ready");
         Ok(())
     }
 
     /// Drop all tables (destructive!).
     pub async fn drop_all_tables(&self) -> Result<()> {
-        sqlx::query("DROP TABLE IF EXISTS invites CASCADE")
+        sqlx::query("DROP TABLE IF EXISTS invites")
             .execute(&self.pool)
             .await
             .context("dropping invites table")?;
-        sqlx::query("DROP TABLE IF EXISTS nodes CASCADE")
+        sqlx::query("DROP TABLE IF EXISTS updates")
+            .execute(&self.pool)
+            .await
+            .context("dropping updates table")?;
+        sqlx::query("DROP TABLE IF EXISTS nodes")
             .execute(&self.pool)
             .await
             .context("dropping nodes table")?;
@@ -166,10 +159,10 @@ impl Db {
     /// Insert a new node record.
     pub async fn insert_node(&self, node: &NodeRecord) -> Result<()> {
         sqlx::query(
-            r#"INSERT INTO nodes (node_id, node_name, public_key, private_key_encrypted,
+            "INSERT INTO nodes (node_id, node_name, public_key, private_key_encrypted,
                virtual_ip, auth_token, status, endpoint, ipv6_endpoint, listen_port,
-               last_heartbeat, created_at, updated_at, port_range_start, port_range_size)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)"#,
+               last_heartbeat, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&node.node_id)
         .bind(&node.node_name)
@@ -184,8 +177,6 @@ impl Db {
         .bind(node.last_heartbeat)
         .bind(node.created_at)
         .bind(node.updated_at)
-        .bind(node.port_range_start)
-        .bind(node.port_range_size)
         .execute(&self.pool)
         .await
         .context("inserting node")?;
@@ -194,27 +185,25 @@ impl Db {
 
     /// Get a node by its ID.
     pub async fn get_node(&self, node_id: &str) -> Result<Option<NodeRecord>> {
-        let node = sqlx::query_as::<_, NodeRecord>("SELECT * FROM nodes WHERE node_id = $1")
+        sqlx::query_as::<_, NodeRecord>("SELECT * FROM nodes WHERE node_id = ?")
             .bind(node_id)
             .fetch_optional(&self.pool)
             .await
-            .context("fetching node")?;
-        Ok(node)
+            .context("fetching node")
     }
 
     /// Get a node by its public key.
     pub async fn get_node_by_pubkey(&self, public_key: &[u8]) -> Result<Option<NodeRecord>> {
-        let node = sqlx::query_as::<_, NodeRecord>("SELECT * FROM nodes WHERE public_key = $1")
+        sqlx::query_as::<_, NodeRecord>("SELECT * FROM nodes WHERE public_key = ?")
             .bind(public_key)
             .fetch_optional(&self.pool)
             .await
-            .context("fetching node by pubkey")?;
-        Ok(node)
+            .context("fetching node by pubkey")
     }
 
     /// Update a node's status.
     pub async fn update_node_status(&self, node_id: &str, status: &str) -> Result<()> {
-        sqlx::query("UPDATE nodes SET status = $1, updated_at = NOW() WHERE node_id = $2")
+        sqlx::query("UPDATE nodes SET status = ?, updated_at = datetime('now') WHERE node_id = ?")
             .bind(status)
             .bind(node_id)
             .execute(&self.pool)
@@ -224,15 +213,11 @@ impl Db {
     }
 
     /// Update a node's last heartbeat timestamp and optionally its endpoint.
-    pub async fn update_heartbeat(
-        &self,
-        node_id: &str,
-        endpoint: Option<&str>,
-    ) -> Result<()> {
+    pub async fn update_heartbeat(&self, node_id: &str, endpoint: Option<&str>) -> Result<()> {
         sqlx::query(
-            r#"UPDATE nodes SET last_heartbeat = NOW(), updated_at = NOW(),
-               status = 'active', endpoint = COALESCE($1, endpoint)
-               WHERE node_id = $2"#,
+            "UPDATE nodes SET last_heartbeat = datetime('now'), updated_at = datetime('now'),
+               status = 'active', endpoint = COALESCE(?, endpoint)
+               WHERE node_id = ?",
         )
         .bind(endpoint)
         .bind(node_id)
@@ -244,23 +229,22 @@ impl Db {
 
     /// List all active nodes (status = 'registered' or 'active').
     pub async fn list_active_nodes(&self) -> Result<Vec<NodeRecord>> {
-        let nodes = sqlx::query_as::<_, NodeRecord>(
+        sqlx::query_as::<_, NodeRecord>(
             "SELECT * FROM nodes WHERE status IN ('registered', 'active') ORDER BY created_at",
         )
         .fetch_all(&self.pool)
         .await
-        .context("listing active nodes")?;
-        Ok(nodes)
+        .context("listing active nodes")
     }
 
     /// Mark nodes as stale if they haven't sent a heartbeat in the given duration.
     pub async fn mark_stale_nodes(&self, stale_seconds: i64) -> Result<u64> {
+        let cutoff = Utc::now() - chrono::Duration::seconds(stale_seconds);
         let result = sqlx::query(
-            r#"UPDATE nodes SET status = 'stale', updated_at = NOW()
-               WHERE status = 'active'
-               AND last_heartbeat < NOW() - INTERVAL '1 second' * $1"#,
+            "UPDATE nodes SET status = 'stale', updated_at = datetime('now')
+               WHERE status = 'active' AND last_heartbeat < ?",
         )
-        .bind(stale_seconds)
+        .bind(cutoff)
         .execute(&self.pool)
         .await
         .context("marking stale nodes")?;
@@ -268,15 +252,11 @@ impl Db {
     }
 
     /// Update a node's endpoint and heartbeat by its public key (used by UDP registration).
-    pub async fn update_endpoint_by_pubkey(
-        &self,
-        public_key: &[u8],
-        endpoint: &str,
-    ) -> Result<bool> {
+    pub async fn update_endpoint_by_pubkey(&self, public_key: &[u8], endpoint: &str) -> Result<bool> {
         let result = sqlx::query(
-            r#"UPDATE nodes SET endpoint = $1, last_heartbeat = NOW(), updated_at = NOW(),
-               status = 'active'
-               WHERE public_key = $2 AND status IN ('registered', 'active')"#,
+            "UPDATE nodes SET endpoint = ?, last_heartbeat = datetime('now'),
+               updated_at = datetime('now'), status = 'active'
+               WHERE public_key = ? AND status IN ('registered', 'active')",
         )
         .bind(endpoint)
         .bind(public_key)
@@ -293,8 +273,8 @@ impl Db {
         lan_endpoint: Option<&str>,
     ) -> Result<bool> {
         let result = sqlx::query(
-            r#"UPDATE nodes SET lan_endpoint = $1, updated_at = NOW()
-               WHERE public_key = $2 AND status IN ('registered', 'active')"#,
+            "UPDATE nodes SET lan_endpoint = ?, updated_at = datetime('now')
+               WHERE public_key = ? AND status IN ('registered', 'active')",
         )
         .bind(lan_endpoint)
         .bind(public_key)
@@ -305,14 +285,10 @@ impl Db {
     }
 
     /// Update a node's IPv6 endpoint by its public key.
-    pub async fn update_ipv6_endpoint_by_pubkey(
-        &self,
-        public_key: &[u8],
-        ipv6_endpoint: &str,
-    ) -> Result<bool> {
+    pub async fn update_ipv6_endpoint_by_pubkey(&self, public_key: &[u8], ipv6_endpoint: &str) -> Result<bool> {
         let result = sqlx::query(
-            r#"UPDATE nodes SET ipv6_endpoint = $1, updated_at = NOW()
-               WHERE public_key = $2 AND status IN ('registered', 'active')"#,
+            "UPDATE nodes SET ipv6_endpoint = ?, updated_at = datetime('now')
+               WHERE public_key = ? AND status IN ('registered', 'active')",
         )
         .bind(ipv6_endpoint)
         .bind(public_key)
@@ -326,7 +302,7 @@ impl Db {
 
     /// Create a new invite code with a maximum number of uses (0 = unlimited).
     pub async fn create_invite(&self, code: &str, expires_at: DateTime<Utc>, max_uses: i32) -> Result<()> {
-        sqlx::query("INSERT INTO invites (code, expires_at, max_uses) VALUES ($1, $2, $3)")
+        sqlx::query("INSERT INTO invites (code, expires_at, max_uses) VALUES (?, ?, ?)")
             .bind(code)
             .bind(expires_at)
             .bind(max_uses)
@@ -338,22 +314,21 @@ impl Db {
 
     /// Get an invite by code.
     pub async fn get_invite(&self, code: &str) -> Result<Option<InviteRecord>> {
-        let invite = sqlx::query_as::<_, InviteRecord>("SELECT * FROM invites WHERE code = $1")
+        sqlx::query_as::<_, InviteRecord>("SELECT * FROM invites WHERE code = ?")
             .bind(code)
             .fetch_optional(&self.pool)
             .await
-            .context("fetching invite")?;
-        Ok(invite)
+            .context("fetching invite")
     }
 
     /// Increment the use count of an invite. Sets used_at on first use.
     pub async fn increment_invite_use(&self, code: &str, node_id: &str) -> Result<()> {
         sqlx::query(
-            r#"UPDATE invites SET
+            "UPDATE invites SET
                use_count = use_count + 1,
-               used_at = COALESCE(used_at, NOW()),
-               used_by_node_id = $1
-               WHERE code = $2"#,
+               used_at = COALESCE(used_at, datetime('now')),
+               used_by_node_id = ?
+               WHERE code = ?",
         )
         .bind(node_id)
         .bind(code)
@@ -365,7 +340,7 @@ impl Db {
 
     /// Update a node's status and update updated_at timestamp.
     pub async fn set_node_status(&self, node_id: &str, status: &str) -> Result<()> {
-        sqlx::query("UPDATE nodes SET status = $1, updated_at = NOW() WHERE node_id = $2")
+        sqlx::query("UPDATE nodes SET status = ?, updated_at = datetime('now') WHERE node_id = ?")
             .bind(status)
             .bind(node_id)
             .execute(&self.pool)
@@ -376,14 +351,12 @@ impl Db {
 
     // --- IP allocation helper ---
 
-    /// Get all virtual IPs currently allocated to active/registered nodes.
+    /// Get all virtual IPs currently allocated to nodes (any status).
     pub async fn allocated_ips(&self) -> Result<Vec<String>> {
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT virtual_ip FROM nodes",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .context("listing allocated IPs")?;
+        let rows: Vec<(String,)> = sqlx::query_as("SELECT virtual_ip FROM nodes")
+            .fetch_all(&self.pool)
+            .await
+            .context("listing allocated IPs")?;
         Ok(rows.into_iter().map(|(ip,)| ip).collect())
     }
 
@@ -391,47 +364,28 @@ impl Db {
 
     /// List all nodes (all statuses), ordered by creation time.
     pub async fn list_all_nodes(&self) -> Result<Vec<NodeRecord>> {
-        let nodes = sqlx::query_as::<_, NodeRecord>(
-            "SELECT * FROM nodes ORDER BY created_at",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .context("listing all nodes")?;
-        Ok(nodes)
+        sqlx::query_as::<_, NodeRecord>("SELECT * FROM nodes ORDER BY created_at")
+            .fetch_all(&self.pool)
+            .await
+            .context("listing all nodes")
     }
 
     /// List all invites, ordered by creation time.
     pub async fn list_all_invites(&self) -> Result<Vec<InviteRecord>> {
-        let invites = sqlx::query_as::<_, InviteRecord>(
-            "SELECT * FROM invites ORDER BY created_at",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .context("listing all invites")?;
-        Ok(invites)
+        sqlx::query_as::<_, InviteRecord>("SELECT * FROM invites ORDER BY created_at")
+            .fetch_all(&self.pool)
+            .await
+            .context("listing all invites")
     }
 
-    /// Revoke an invite by setting its expiry to NOW().
+    /// Revoke an invite by setting its expiry to now.
     pub async fn revoke_invite(&self, code: &str) -> Result<bool> {
-        let result = sqlx::query("UPDATE invites SET expires_at = NOW() WHERE code = $1")
+        let result = sqlx::query("UPDATE invites SET expires_at = datetime('now') WHERE code = ?")
             .bind(code)
             .execute(&self.pool)
             .await
             .context("revoking invite")?;
         Ok(result.rows_affected() > 0)
-    }
-
-    /// Get all allocated port_range_start values for active/registered nodes.
-    pub async fn allocated_port_ranges(&self) -> Result<Vec<i32>> {
-        let rows: Vec<(i32,)> = sqlx::query_as(
-            "SELECT port_range_start FROM nodes \
-             WHERE status IN ('registered', 'active') \
-             AND port_range_start IS NOT NULL",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .context("listing allocated port ranges")?;
-        Ok(rows.into_iter().map(|(s,)| s).collect())
     }
 
     // --- Update operations ---
@@ -444,17 +398,22 @@ impl Db {
         binary_size: i64,
         uploaded_by: &str,
     ) -> Result<i64> {
-        let row: (i64,) = sqlx::query_as(
-            r#"INSERT INTO updates (description, binary_hash, binary_size, uploaded_by)
-               VALUES ($1, $2, $3, $4) RETURNING id"#,
+        sqlx::query(
+            "INSERT INTO updates (description, binary_hash, binary_size, uploaded_by)
+               VALUES (?, ?, ?, ?)",
         )
         .bind(description)
         .bind(binary_hash)
         .bind(binary_size)
         .bind(uploaded_by)
-        .fetch_one(&self.pool)
+        .execute(&self.pool)
         .await
         .context("inserting update record")?;
+
+        let row: (i64,) = sqlx::query_as("SELECT last_insert_rowid()")
+            .fetch_one(&self.pool)
+            .await
+            .context("fetching inserted update ID")?;
         Ok(row.0)
     }
 
@@ -478,7 +437,7 @@ impl Db {
 
     /// Replace a node's auth_token with a new one.
     pub async fn rotate_node_token(&self, node_id: &str, new_token: &str) -> Result<()> {
-        sqlx::query("UPDATE nodes SET auth_token = $1, updated_at = NOW() WHERE node_id = $2")
+        sqlx::query("UPDATE nodes SET auth_token = ?, updated_at = datetime('now') WHERE node_id = ?")
             .bind(new_token)
             .bind(node_id)
             .execute(&self.pool)
@@ -491,8 +450,7 @@ impl Db {
     /// an active or registered node, None otherwise.
     pub async fn validate_peer_token(&self, token: &str) -> Result<Option<String>> {
         let row: Option<(String,)> = sqlx::query_as(
-            "SELECT node_id FROM nodes \
-             WHERE auth_token = $1 AND status IN ('registered', 'active')",
+            "SELECT node_id FROM nodes WHERE auth_token = ? AND status IN ('registered', 'active')",
         )
         .bind(token)
         .fetch_optional(&self.pool)

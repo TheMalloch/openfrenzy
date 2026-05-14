@@ -38,8 +38,6 @@ pub type PeerMap = Arc<Mutex<HashMap<[u8; 32], RegisteredPeer>>>;
 
 /// Protocol constants (must match meshlink client).
 mod proto {
-    pub const NAT_DETECT_REQ: u8 = 0x10;
-    pub const NAT_DETECT_RESP: u8 = 0x11;
     pub const REGISTER: u8 = 0x30;
     pub const PEER_LIST_REQ: u8 = 0x31;
     pub const PEER_LIST_RESP: u8 = 0x32;
@@ -255,9 +253,6 @@ async fn handle_message(
     src: SocketAddr,
 ) {
     match data[0] {
-        proto::NAT_DETECT_REQ => {
-            handle_nat_detect(socket, src).await;
-        }
         proto::REGISTER => {
             handle_register(socket, peers, database, data, src).await;
         }
@@ -270,27 +265,6 @@ async fn handle_message(
         t => {
             debug!(msg_type = t, %src, "unknown message type");
         }
-    }
-}
-
-async fn handle_nat_detect(socket: &UdpSocket, src: SocketAddr) {
-    debug!(%src, "NAT detection request");
-
-    let mut resp = vec![proto::NAT_DETECT_RESP];
-    match src.ip() {
-        std::net::IpAddr::V4(ip) => {
-            resp.push(0x04);
-            resp.extend_from_slice(&ip.octets());
-        }
-        std::net::IpAddr::V6(ip) => {
-            resp.push(0x06);
-            resp.extend_from_slice(&ip.octets());
-        }
-    }
-    resp.extend_from_slice(&src.port().to_be_bytes());
-
-    if let Err(e) = socket.send_to(&resp, src).await {
-        warn!(error = %e, "failed to send NAT detect response");
     }
 }
 

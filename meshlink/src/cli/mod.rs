@@ -73,9 +73,9 @@ pub enum Command {
 pub enum CsAction {
     /// Start the coordination server (UDP + HTTP).
     Start {
-        /// PostgreSQL connection URL.
+        /// SQLite database file path (e.g. /var/lib/meshlink/coord.db).
         #[arg(long)]
-        database_url: Option<String>,
+        database_path: Option<String>,
         /// Mesh network CIDR (e.g. 10.0.0.0/24).
         #[arg(long)]
         mesh_cidr: Option<String>,
@@ -91,12 +91,6 @@ pub enum CsAction {
         /// Public address peers use to reach this server.
         #[arg(long)]
         external_address: Option<String>,
-        /// Path to TLS certificate file.
-        #[arg(long)]
-        tls_cert: Option<String>,
-        /// Path to TLS private key file.
-        #[arg(long)]
-        tls_key: Option<String>,
         /// Admin API bearer token.
         #[arg(long)]
         admin_token: Option<String>,
@@ -121,21 +115,6 @@ pub enum CsAction {
         /// Log level (trace, debug, info, warn, error).
         #[arg(long)]
         log_level: Option<String>,
-        /// Base port for per-peer port range allocation.
-        #[arg(long)]
-        port_range_base: Option<u16>,
-        /// Number of ports per peer block.
-        #[arg(long)]
-        port_range_block_size: Option<u16>,
-        /// Path to write the generated Caddy config file.
-        #[arg(long)]
-        caddy_config_path: Option<String>,
-        /// Caddy admin API URL (e.g. http://localhost:2019).
-        #[arg(long)]
-        caddy_admin_api: Option<String>,
-        /// Public domain used in generated Caddy server blocks.
-        #[arg(long)]
-        caddy_external_domain: Option<String>,
     },
     /// Create database tables.
     DbSetup,
@@ -179,8 +158,6 @@ pub enum CsAction {
         /// The invite code to revoke.
         code: String,
     },
-    /// Regenerate Caddy config from database and reload Caddy.
-    CaddyRegen,
 }
 
 /// Parameters for server-orchestrated mode, resolved from CLI args, credentials, or env vars.
