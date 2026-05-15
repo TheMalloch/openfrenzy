@@ -159,6 +159,8 @@ func (s *Server) handleMessage(data []byte, src *net.UDPAddr) {
 		return
 	}
 	switch data[0] {
+	case proto.NATDetect:
+		s.handleNATDetect(src)
 	case proto.Register:
 		s.handleRegister(data, src)
 	case proto.PeerListReq:
@@ -168,6 +170,23 @@ func (s *Server) handleMessage(data []byte, src *net.UDPAddr) {
 	default:
 		slog.Debug("unknown UDP message type", "type", data[0], "src", src)
 	}
+}
+
+func (s *Server) handleNATDetect(src *net.UDPAddr) {
+	var resp []byte
+	if ip4 := src.IP.To4(); ip4 != nil {
+		resp = []byte{proto.NATDetectResp, 0x04, ip4[0], ip4[1], ip4[2], ip4[3], byte(src.Port >> 8), byte(src.Port)}
+	} else {
+		ip6 := src.IP.To16()
+		resp = make([]byte, 20)
+		resp[0] = proto.NATDetectResp
+		resp[1] = 0x06
+		copy(resp[2:18], ip6)
+		resp[18] = byte(src.Port >> 8)
+		resp[19] = byte(src.Port)
+	}
+	s.conn.WriteToUDP(resp, src)
+	slog.Debug("NAT detect response sent", "src", src)
 }
 
 func (s *Server) handleRegister(data []byte, src *net.UDPAddr) {

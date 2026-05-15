@@ -8,6 +8,11 @@ pub fn create_tun_device(
     name: &str,
     virtual_ip: ipnet::Ipv4Net,
 ) -> Result<tun::AsyncDevice> {
+    // Remove any stale interface left by a previous crashed run.
+    let _ = std::process::Command::new("ip")
+        .args(["link", "delete", name])
+        .output();
+
     let mut config = tun::Configuration::default();
     config
         .tun_name(name)
