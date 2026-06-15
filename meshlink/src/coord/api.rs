@@ -137,12 +137,17 @@ pub async fn run_http_server(
 struct RegisterRequest {
     invite_code: String,
     node_name: Option<String>,
+    /// Base64-encoded X25519 public key. When supplied, the coordinator skips key
+    /// generation and never stores or returns a private key (BYOK mode).
+    public_key: Option<String>,
 }
 
 #[derive(Serialize)]
 struct RegisterResponse {
     node_id: String,
-    private_key: String,
+    /// Absent when the peer supplied its own public key (BYOK mode).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    private_key: Option<String>,
     public_key: String,
     virtual_ip: String,
     config_toml: String,
@@ -295,8 +300,33 @@ async fn register(
         return error_response(StatusCode::BAD_REQUEST, "invite code expired").into_response();
     }
 
-    // Generate keypair
-    let (private_key, public_key) = key_manager::generate_node_keypair();
+    // Resolve keypair: BYOK (peer supplies public key) or coordinator-generated.
+    let (private_key_opt, public_key): (Option<[u8; 32]>, [u8; 32]) =
+        if let Some(ref pk_b64) = req.public_key {
+            let decoded = match base64::engine::general_purpose::STANDARD.decode(pk_b64) {
+                Ok(b) => b,
+                Err(_) => {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        "invalid public_key: not valid base64",
+                    )
+                    .into_response()
+                }
+            };
+            if decoded.len() != 32 {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid public_key: must be 32 bytes",
+                )
+                .into_response();
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&decoded);
+            (None, arr)
+        } else {
+            let (priv_key, pub_key) = key_manager::generate_node_keypair();
+            (Some(priv_key), pub_key)
+        };
 
     // Allocate IP
     let allocated = match state.db.allocated_ips().await {
@@ -344,7 +374,7 @@ async fn register(
         node_id: node_id.clone(),
         node_name: req.node_name.clone(),
         public_key: public_key.to_vec(),
-        private_key_encrypted: private_key.to_vec(),
+        private_key_encrypted: private_key_opt.map(|k| k.to_vec()).unwrap_or_default(),
         virtual_ip: virtual_ip.clone(),
         auth_token: auth_token.clone(),
         status: "registered".to_string(),
@@ -378,7 +408,16 @@ async fn register(
         &state.coord_server_addr,
     );
 
-    let private_key_b64 = base64::engine::general_purpose::STANDARD.encode(private_key);
+    let private_key_b64 = node_record
+        .private_key_encrypted
+        .is_empty()
+        .then(|| None)
+        .unwrap_or_else(|| {
+            Some(
+                base64::engine::general_purpose::STANDARD
+                    .encode(&node_record.private_key_encrypted),
+            )
+        });
     let public_key_b64 = base64::engine::general_purpose::STANDARD.encode(public_key);
 
     info!(

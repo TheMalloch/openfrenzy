@@ -7,20 +7,19 @@ pub fn generate_config(
     peers: &[NodeRecord],
     coord_server: &str,
 ) -> String {
-    let private_key_b64 =
-        base64::engine::general_purpose::STANDARD.encode(&node.private_key_encrypted);
     let virtual_ip = &node.virtual_ip;
 
-    let mut config = format!(
-        r#"[node]
-private_key = "{private_key_b64}"
-listen_port = {listen_port}
-virtual_ip = "{virtual_ip}"
-tun_name = "meshlink0"
+    // BYOK nodes have an empty private_key_encrypted — omit the field so the
+    // peer can supply its own key when starting the daemon.
+    let private_key_line = if node.private_key_encrypted.is_empty() {
+        String::new()
+    } else {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&node.private_key_encrypted);
+        format!("private_key = \"{b64}\"\n")
+    };
 
-[coordination]
-server = "{coord_server}"
-"#,
+    let mut config = format!(
+        "[node]\n{private_key_line}listen_port = {listen_port}\nvirtual_ip = \"{virtual_ip}\"\ntun_name = \"meshlink0\"\n\n[coordination]\nserver = \"{coord_server}\"\n",
         listen_port = node.listen_port,
     );
 
@@ -68,10 +67,13 @@ mod tests {
             status: "active".to_string(),
             endpoint: None,
             ipv6_endpoint: None,
+            lan_endpoint: None,
             listen_port: 51820,
             last_heartbeat: Some(Utc::now()),
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            port_range_start: None,
+            port_range_size: None,
         }
     }
 

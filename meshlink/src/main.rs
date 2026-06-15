@@ -51,6 +51,7 @@ fn main() -> Result<()> {
         server,
         invite: Some(invite_code),
         name,
+        public_key: byok_public_key,
         ..
     }) = &cli.command
     {
@@ -68,7 +69,9 @@ fn main() -> Result<()> {
 
             println!("Registering with server {server_url}...");
             let client = api_client::ApiClient::new(server_url);
-            let resp = client.register(invite_code, name.as_deref()).await?;
+            let resp = client
+                .register(invite_code, name.as_deref(), byok_public_key.as_deref())
+                .await?;
 
             // Save credentials
             let creds = credentials::Credentials {

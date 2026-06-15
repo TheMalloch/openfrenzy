@@ -13,6 +13,11 @@ Group=meshlink
 
 # Config is read from /etc/meshlink/config.toml (written by `meshlink up --invite`).
 # Credentials are read from /etc/meshlink/credentials.json.
+#
+# Remove any stale TUN device left behind by an unclean stop so the daemon never
+# fails to start with "creating TUN device meshlink0: Device or resource busy".
+# Leading '-' makes systemd ignore the expected failure when the device is absent.
+ExecStartPre=-/sbin/ip link delete meshlink0
 ExecStart=/usr/local/bin/meshlink up --foreground
 
 # Peer daemon handles SIGTERM natively

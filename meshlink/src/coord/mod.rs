@@ -314,9 +314,18 @@ impl CoordServerConfig {
     }
 
     fn from_file(file: CoordConfigFile) -> Self {
+        // Priority: explicit coord_addr, then external_address:udp_port, then the
+        // 0.0.0.0 fallback. Keep this consistent with from_env() so that a present
+        // coord.toml does not silently ignore the external_address (or the
+        // EXTERNAL_ADDRESS env value the setup scripts write).
         let coord_server_addr = file
             .server
             .coord_addr
+            .clone()
+            .or_else(|| {
+                let ext = file.server.external_address.trim();
+                (!ext.is_empty()).then(|| format!("{ext}:{}", file.server.udp_port))
+            })
             .unwrap_or_else(|| format!("0.0.0.0:{}", file.server.udp_port));
         Self {
             database_url: file.database.url,
@@ -391,6 +400,19 @@ pub async fn run(config: CoordServerConfig) -> Result<()> {
             .with_context(|| format!("binding UDP to {udp_addr}"))?,
     );
     info!(listen_addr = %udp_addr, "UDP socket bound");
+
+    // Guard against the classic misconfiguration: an unroutable coord_server_addr
+    // gets baked into every peer's generated config.toml, so peers send keepalives
+    // to 0.0.0.0 (their own localhost) and never register. Warn loudly rather than
+    // silently handing out a dead address.
+    if config.coord_server_addr.starts_with("0.0.0.0:") {
+        tracing::error!(
+            coord_server_addr = %config.coord_server_addr,
+            "coord_server_addr is unroutable (0.0.0.0): peers will receive this as their \
+             coordination server and be unable to reach it. Set [server] coord_addr or \
+             external_address in coord.toml (or COORD_SERVER_ADDR / EXTERNAL_ADDRESS in coord.env)."
+        );
+    }
 
     // Create shared peer map
     let peers: udp_handler::PeerMap = Arc::new(Mutex::new(HashMap::new()));

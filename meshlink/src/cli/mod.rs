@@ -40,6 +40,11 @@ pub enum Command {
         #[arg(long)]
         coord_server: Option<String>,
 
+        /// Base64-encoded X25519 public key for BYOK registration (used with --invite).
+        /// When provided the coordinator will not generate or store a private key.
+        #[arg(long)]
+        public_key: Option<String>,
+
         /// Run in the foreground instead of daemonizing.
         #[arg(short = 'f', long)]
         foreground: bool,
