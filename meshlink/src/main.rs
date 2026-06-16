@@ -437,6 +437,18 @@ async fn handle_cs_action(config_path: &std::path::Path, action: &cli::CsAction)
             coord::caddy::write_and_reload(&config.caddy_config_path, &config.caddy_admin_api, &content).await?;
             println!("Caddy config written to {} and reloaded.", config.caddy_config_path);
         }
+        cli::CsAction::Restart => {
+            let status = tokio::process::Command::new("systemctl")
+                .args(["restart", "meshlink-coord"])
+                .status()
+                .await
+                .context("running systemctl restart meshlink-coord")?;
+            if status.success() {
+                println!("meshlink-coord restarted.");
+            } else {
+                anyhow::bail!("systemctl restart meshlink-coord failed (exit code {:?})", status.code());
+            }
+        }
     }
 
     Ok(())

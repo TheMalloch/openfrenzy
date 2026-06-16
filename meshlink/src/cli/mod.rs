@@ -186,6 +186,8 @@ pub enum CsAction {
     },
     /// Regenerate Caddy config from database and reload Caddy.
     CaddyRegen,
+    /// Restart the coordination server via systemctl.
+    Restart,
 }
 
 /// Parameters for server-orchestrated mode, resolved from CLI args, credentials, or env vars.

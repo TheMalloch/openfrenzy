@@ -276,7 +276,7 @@ impl Db {
         let result = sqlx::query(
             r#"UPDATE nodes SET endpoint = $1, last_heartbeat = NOW(), updated_at = NOW(),
                status = 'active'
-               WHERE public_key = $2 AND status IN ('registered', 'active')"#,
+               WHERE public_key = $2 AND status IN ('registered', 'active', 'stale')"#,
         )
         .bind(endpoint)
         .bind(public_key)
@@ -294,7 +294,7 @@ impl Db {
     ) -> Result<bool> {
         let result = sqlx::query(
             r#"UPDATE nodes SET lan_endpoint = $1, updated_at = NOW()
-               WHERE public_key = $2 AND status IN ('registered', 'active')"#,
+               WHERE public_key = $2 AND status IN ('registered', 'active', 'stale')"#,
         )
         .bind(lan_endpoint)
         .bind(public_key)
@@ -312,7 +312,7 @@ impl Db {
     ) -> Result<bool> {
         let result = sqlx::query(
             r#"UPDATE nodes SET ipv6_endpoint = $1, updated_at = NOW()
-               WHERE public_key = $2 AND status IN ('registered', 'active')"#,
+               WHERE public_key = $2 AND status IN ('registered', 'active', 'stale')"#,
         )
         .bind(ipv6_endpoint)
         .bind(public_key)
