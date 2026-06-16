@@ -6,8 +6,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
-use tokio::time::{interval, timeout, Duration};
-use tracing::{debug, error, info, warn};
+use tokio::time::{interval, sleep, timeout, Duration};
+use tracing::{debug, info, warn};
 
 /// Protocol message types for coordination server communication.
 mod proto {
@@ -189,13 +189,23 @@ pub async fn discovery_task(
     let lan_ips = get_lan_ips(virtual_ip);
     info!(?lan_ips, "detected LAN IPs");
 
-    // Initial registration with LAN IPs
-    let reg_msg = build_register_msg(&our_pub_key, listen_port, &lan_ips);
-    if let Err(e) = socket.send_to(&reg_msg, coord_addr).await {
-        error!(error = %e, "failed to register with coordination server");
-        return;
+    // Initial registration with retry/backoff — does not exit on failure so that
+    // cached/static peers keep working while the coord is unreachable.
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        let reg_msg = build_register_msg(&our_pub_key, listen_port, &get_lan_ips(virtual_ip));
+        match socket.send_to(&reg_msg, coord_addr).await {
+            Ok(_) => {
+                info!(%coord_addr, "registered with coordination server");
+                break;
+            }
+            Err(e) => {
+                warn!(error = %e, ?backoff, "coord unreachable, will retry");
+                sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(60));
+            }
+        }
     }
-    info!(%coord_addr, "registered with coordination server");
 
     // NAT detection (response comes through coord_rx)
     match hole_punch::detect_nat(&socket, &coord_addr, &mut coord_rx).await {
@@ -220,7 +230,7 @@ pub async fn discovery_task(
                 // Request peer list
                 let req = build_peer_list_req(&our_pub_key);
                 if let Err(e) = socket.send_to(&req, coord_addr).await {
-                    error!(error = %e, "failed to send peer list request");
+                    warn!(error = %e, "failed to send peer list request");
                     continue;
                 }
 
