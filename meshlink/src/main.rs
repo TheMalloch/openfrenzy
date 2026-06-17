@@ -537,10 +537,35 @@ async fn run_daemon(
 
     // Parse coordination server address — prefer IPv4 so the coord server sees our
     // IPv4 source address (peers without IPv6 can't reach an IPv6-only endpoint).
+    //
+    // The `server` field may be written as a bare "host:port" (canonical) or as
+    // "https://host" / "http://host" (common misconfiguration when the same domain
+    // is used for HTTPS registration).  Strip any scheme and supply the default UDP
+    // port (4000) when none is present.
+    let coord_server_raw = config.coordination.server.trim();
+    let coord_server_host = coord_server_raw
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    let coord_server_str = if coord_server_host.contains(':') {
+        coord_server_host.to_string()
+    } else {
+        format!("{coord_server_host}:4000")
+    };
+
+    // If api_url wasn't set but the server field was an HTTPS URL, derive it now
+    // so the HTTP fallback activates automatically.
+    if config.coordination.api_url.is_none()
+        && coord_server_raw.starts_with("https://")
+    {
+        let host = coord_server_host.split('/').next().unwrap_or(coord_server_host);
+        config.coordination.api_url = Some(format!("https://{host}"));
+    }
+
     let coord_addr: std::net::SocketAddr = {
-        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&config.coordination.server)
+        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&coord_server_str)
             .await
-            .context("resolving coordination server")?
+            .with_context(|| format!("resolving coordination server '{coord_server_str}'"))?
             .collect();
         addrs
             .iter()
