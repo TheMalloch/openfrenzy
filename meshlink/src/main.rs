@@ -605,6 +605,11 @@ async fn run_daemon(
         channels.router_to_tun_tx,
     ));
 
+    let http_fallback = discovery::build_http_fallback(
+        config.coordination.api_url.clone(),
+        config.coordination.auth_token.clone(),
+    );
+
     let discovery = tokio::spawn(discovery::discovery_task(
         shared_state.clone(),
         identity.clone(),
@@ -614,6 +619,7 @@ async fn run_daemon(
         config_path.to_path_buf(),
         config.node.virtual_ip.addr(),
         coord_rx,
+        http_fallback,
     ));
 
     let cli_listener = tokio::spawn(cli::cli_listener_task(shared_state.clone()));

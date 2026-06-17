@@ -9,7 +9,7 @@ use super::scanner::{ScanState, SseTx};
 use super::udp_handler::{self, PeerMap};
 use super::update_store::UpdateStore;
 use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse};
@@ -20,8 +20,9 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::net::UdpSocket;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
@@ -35,6 +36,7 @@ pub struct AppState {
     pub ip_allocator: IpAllocator,
     pub port_allocator: PortAllocator,
     pub coord_server_addr: String,
+    pub coord_api_url: Option<String>,
     pub admin_token: Option<String>,
     pub default_listen_port: u16,
     pub default_expiry_hours: i64,
@@ -62,8 +64,10 @@ fn router(state: AppState) -> Router {
         // Admin invite endpoints
         .route("/api/v1/admin/invites", get(list_invites))
         .route("/api/v1/admin/invites/{code}", delete(revoke_invite))
-        // Peer token rotation (authenticated with current peer token)
+        // Peer node endpoints (authenticated with peer token)
         .route("/api/v1/node/token", patch(rotate_peer_token))
+        .route("/api/v1/node/keepalive", post(http_keepalive))
+        .route("/api/v1/node/peers", get(http_peer_list))
         // Update distribution (admin or peer token)
         .route("/api/v1/update", post(publish_update))
         .route("/api/v1/update/latest", get(get_latest_update))
@@ -87,6 +91,7 @@ pub async fn run_http_server(
     ip_allocator: IpAllocator,
     port_allocator: PortAllocator,
     coord_server_addr: String,
+    coord_api_url: Option<String>,
     admin_token: Option<String>,
     default_listen_port: u16,
     default_expiry_hours: i64,
@@ -105,6 +110,7 @@ pub async fn run_http_server(
         ip_allocator,
         port_allocator,
         coord_server_addr,
+        coord_api_url,
         admin_token,
         default_listen_port,
         default_expiry_hours,
@@ -126,7 +132,12 @@ pub async fn run_http_server(
         .expect("bind HTTP listener");
     info!(%addr, "HTTP API server starting");
 
-    if let Err(e) = axum::serve(listener, app).await {
+    if let Err(e) = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    {
         warn!(error = %e, "HTTP server error");
     }
 }
@@ -406,6 +417,7 @@ async fn register(
         &node_record,
         &active_nodes,
         &state.coord_server_addr,
+        state.coord_api_url.as_deref(),
     );
 
     let private_key_b64 = node_record
@@ -961,3 +973,155 @@ async fn sse_stream(
         .into_response()
 }
 
+// ---------------------------------------------------------------------------
+// HTTP fallback: keepalive + peer list for nodes that can't reach UDP
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct HttpKeepaliveRequest {
+    listen_port: u16,
+    #[serde(default)]
+    lan_ips: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct HttpPeerEntry {
+    public_key: String,
+    virtual_ip: String,
+    endpoint: Option<String>,
+    lan_endpoint: Option<String>,
+}
+
+/// Extract the real client IP: prefer X-Real-IP / X-Forwarded-For (set by Caddy),
+/// fall back to the direct TCP connection address.
+fn real_ip(headers: &HeaderMap, conn: SocketAddr) -> IpAddr {
+    if let Some(v) = headers
+        .get("x-real-ip")
+        .or_else(|| headers.get("x-forwarded-for"))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .and_then(|s| s.trim().parse::<IpAddr>().ok())
+    {
+        return v;
+    }
+    conn.ip()
+}
+
+/// POST /api/v1/node/keepalive
+/// Lets a node send a heartbeat via HTTPS when UDP is unreachable.
+async fn http_keepalive(
+    State(state): State<AppState>,
+    ConnectInfo(conn): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(req): Json<HttpKeepaliveRequest>,
+) -> impl IntoResponse {
+    let token = match extract_token(&headers) {
+        Some(t) => t,
+        None => return error_response(StatusCode::UNAUTHORIZED, "missing Authorization").into_response(),
+    };
+
+    let node_id = match state.db.validate_peer_token(&token).await {
+        Ok(Some(id)) => id,
+        Ok(None) => return error_response(StatusCode::UNAUTHORIZED, "invalid token").into_response(),
+        Err(e) => {
+            warn!(error = %e, "db error in http_keepalive");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    };
+
+    let node = match state.db.get_node(&node_id).await {
+        Ok(Some(n)) => n,
+        Ok(None) => return error_response(StatusCode::UNAUTHORIZED, "invalid token").into_response(),
+        Err(e) => {
+            warn!(error = %e, "db error fetching node in http_keepalive");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    };
+
+    let ip = real_ip(&headers, conn);
+    let endpoint = SocketAddr::new(ip, req.listen_port);
+    let lan_ip = req.lan_ips.first()
+        .and_then(|s| s.parse::<std::net::Ipv4Addr>().ok());
+
+    // Update in-memory peer map
+    if node.public_key.len() == 32 {
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&node.public_key);
+        let mut map = state.peer_map.lock().await;
+        let entry = map.entry(key).or_insert_with(|| udp_handler::RegisteredPeer {
+            public_key: key,
+            endpoint,
+            listen_port: req.listen_port,
+            last_seen: Instant::now(),
+            virtual_ip: node.virtual_ip.split('/').next().and_then(|s| s.parse().ok()),
+            lan_ip,
+        });
+        entry.last_seen = Instant::now();
+        entry.endpoint = endpoint;
+        entry.lan_ip = lan_ip;
+    }
+
+    // Update DB heartbeat + endpoint
+    if let Err(e) = state.db.update_heartbeat(&node_id, Some(&endpoint.to_string())).await {
+        warn!(error = %e, "failed to update heartbeat in http_keepalive");
+    }
+
+    StatusCode::OK.into_response()
+}
+
+/// GET /api/v1/node/peers
+/// Returns the active peer list as JSON; used by nodes falling back from UDP.
+async fn http_peer_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let token = match extract_token(&headers) {
+        Some(t) => t,
+        None => return error_response(StatusCode::UNAUTHORIZED, "missing Authorization").into_response(),
+    };
+
+    let node_id = match state.db.validate_peer_token(&token).await {
+        Ok(Some(id)) => id,
+        Ok(None) => return error_response(StatusCode::UNAUTHORIZED, "invalid token").into_response(),
+        Err(e) => {
+            warn!(error = %e, "db error in http_peer_list");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    };
+
+    let peers = match state.db.list_active_nodes().await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(error = %e, "failed to list peers for http_peer_list");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    };
+
+    let map = state.peer_map.lock().await;
+    let entries: Vec<HttpPeerEntry> = peers
+        .into_iter()
+        .filter(|p| p.node_id != node_id)
+        .map(|p| {
+            let pub_key_b64 = base64::engine::general_purpose::STANDARD.encode(&p.public_key);
+            let virtual_ip = p.virtual_ip.split('/').next().unwrap_or(&p.virtual_ip).to_string();
+
+            // Prefer live endpoint from peer_map (most recent), fall back to DB
+            let (endpoint, lan_endpoint) = if p.public_key.len() == 32 {
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&p.public_key);
+                let ep = map.get(&key)
+                    .map(|r| r.endpoint.to_string())
+                    .or(p.endpoint.clone());
+                let lan_ep = map.get(&key)
+                    .and_then(|r| r.lan_ip.map(|ip| format!("{}:{}", ip, p.listen_port)));
+                (ep, lan_ep)
+            } else {
+                (p.endpoint.clone(), p.lan_endpoint.clone())
+            };
+
+            HttpPeerEntry { public_key: pub_key_b64, virtual_ip, endpoint, lan_endpoint }
+        })
+        .collect();
+
+    Json(entries).into_response()
+}

@@ -6,6 +6,7 @@ pub fn generate_config(
     node: &NodeRecord,
     peers: &[NodeRecord],
     coord_server: &str,
+    coord_api_url: Option<&str>,
 ) -> String {
     let virtual_ip = &node.virtual_ip;
 
@@ -18,8 +19,13 @@ pub fn generate_config(
         format!("private_key = \"{b64}\"\n")
     };
 
+    let api_url_line = coord_api_url
+        .map(|u| format!("api_url = \"{u}\"\n"))
+        .unwrap_or_default();
+    let auth_token_line = format!("auth_token = \"{}\"\n", node.auth_token);
+
     let mut config = format!(
-        "[node]\n{private_key_line}listen_port = {listen_port}\nvirtual_ip = \"{virtual_ip}\"\ntun_name = \"meshlink0\"\n\n[coordination]\nserver = \"{coord_server}\"\n",
+        "[node]\n{private_key_line}listen_port = {listen_port}\nvirtual_ip = \"{virtual_ip}\"\ntun_name = \"meshlink0\"\n\n[coordination]\nserver = \"{coord_server}\"\n{api_url_line}{auth_token_line}",
         listen_port = node.listen_port,
     );
 
@@ -83,7 +89,7 @@ mod tests {
         let peer = make_node("node2", "10.0.0.2/24", &[3u8; 32], &[4u8; 32]);
 
         let config =
-            generate_config(&node, &[node.clone(), peer.clone()], "coord.example.com:4000");
+            generate_config(&node, &[node.clone(), peer.clone()], "coord.example.com:4000", None);
 
         assert!(config.contains("[node]"));
         assert!(config.contains("private_key ="));
@@ -102,7 +108,7 @@ mod tests {
         let mut peer = make_node("node2", "10.0.0.2/24", &[3u8; 32], &[4u8; 32]);
         peer.endpoint = Some("1.2.3.4:51820".to_string());
 
-        let config = generate_config(&node, &[peer], "coord.example.com:4000");
+        let config = generate_config(&node, &[peer], "coord.example.com:4000", None);
 
         assert!(config.contains("endpoint = \"1.2.3.4:51820\""));
     }
@@ -112,7 +118,7 @@ mod tests {
         let node = make_node("node1", "10.0.0.1/24", &[1u8; 32], &[2u8; 32]);
         let peer = make_node("node2", "10.0.0.2/24", &[3u8; 32], &[4u8; 32]);
 
-        let config = generate_config(&node, &[peer], "coord.example.com:4000");
+        let config = generate_config(&node, &[peer], "coord.example.com:4000", None);
 
         // Verify it parses as valid TOML
         let parsed: toml::Value = toml::from_str(&config).expect("config should be valid TOML");

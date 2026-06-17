@@ -3,7 +3,7 @@
 #
 # Wipes all previous state (config, credentials, service) and prepares
 # the system.  After this runs, register the node with:
-#   sudo meshlink up --server <HTTP_URL> --coord-server <IP:PORT> --invite <TOKEN>
+#   sudo meshlink up --server https://<coord-domain> --invite <TOKEN>
 #
 # Usage:  sudo ./scripts/setup-peer.sh
 #
@@ -226,8 +226,7 @@ fi
 echo ""
 echo "  Register and connect:"
 echo "    sudo meshlink up \\"
-echo "      --server http://<coord-host>:4001 \\"
-echo "      --coord-server <coord-ip>:4000 \\"
+echo "      --server https://<coord-domain> \\"
 echo "      --invite <token>"
 echo ""
 echo "  Then start the background service:"

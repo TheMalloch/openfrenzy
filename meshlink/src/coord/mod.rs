@@ -31,6 +31,7 @@ pub struct CoordServerConfig {
     pub tls_key: Option<String>,
     pub admin_token: Option<String>,
     pub coord_server_addr: String,
+    pub coord_api_url: Option<String>,
     pub stale_timeout_secs: u64,
     pub cleanup_interval_secs: u64,
     pub max_peers: u32,
@@ -111,6 +112,7 @@ pub struct ServerConfig {
     pub http_port: u16,
     pub udp_port: u16,
     pub coord_addr: Option<String>,
+    pub api_url: Option<String>,
     pub bind_address: String,
     pub external_address: String,
     pub tls_cert: Option<String>,
@@ -123,6 +125,7 @@ impl Default for ServerConfig {
             http_port: 4001,
             udp_port: 4000,
             coord_addr: None,
+            api_url: None,
             bind_address: "[::]".into(),
             external_address: String::new(),
             tls_cert: None,
@@ -283,6 +286,11 @@ impl CoordServerConfig {
                     format!("{external_address}:{udp_port}")
                 }
             });
+        let caddy_external_domain = std::env::var("CADDY_EXTERNAL_DOMAIN").unwrap_or_default();
+        let coord_api_url = std::env::var("COORD_API_URL").ok().or_else(|| {
+            let domain = caddy_external_domain.trim();
+            (!domain.is_empty()).then(|| format!("https://{domain}"))
+        });
 
         Ok(Self {
             database_url,
@@ -295,6 +303,7 @@ impl CoordServerConfig {
             tls_key: std::env::var("TLS_KEY").ok(),
             admin_token,
             coord_server_addr,
+            coord_api_url,
             stale_timeout_secs: 120,
             cleanup_interval_secs: 60,
             max_peers: 0,
@@ -306,7 +315,7 @@ impl CoordServerConfig {
             port_range_block_size: 100,
             caddy_config_path: "/etc/caddy/meshlink.conf".into(),
             caddy_admin_api: "http://localhost:2019".into(),
-            caddy_external_domain: std::env::var("CADDY_EXTERNAL_DOMAIN").unwrap_or_default(),
+            caddy_external_domain,
             updates_dir: std::env::var("UPDATES_DIR")
                 .unwrap_or_else(|_| "/var/lib/meshlink/updates".into()),
             scan_interval_secs: 30,
@@ -327,6 +336,10 @@ impl CoordServerConfig {
                 (!ext.is_empty()).then(|| format!("{ext}:{}", file.server.udp_port))
             })
             .unwrap_or_else(|| format!("0.0.0.0:{}", file.server.udp_port));
+        let coord_api_url = file.server.api_url.or_else(|| {
+            let domain = file.caddy.external_domain.trim();
+            (!domain.is_empty()).then(|| format!("https://{domain}"))
+        });
         Self {
             database_url: file.database.url,
             mesh_network: file.network.mesh_cidr,
@@ -338,6 +351,7 @@ impl CoordServerConfig {
             tls_key: file.server.tls_key,
             admin_token: file.admin.token,
             coord_server_addr,
+            coord_api_url,
             stale_timeout_secs: file.peers.stale_timeout_secs,
             cleanup_interval_secs: file.peers.cleanup_interval_secs,
             max_peers: file.peers.max_peers,
@@ -441,6 +455,7 @@ pub async fn run(config: CoordServerConfig) -> Result<()> {
         ip_allocator,
         port_allocator,
         config.coord_server_addr,
+        config.coord_api_url,
         config.admin_token,
         config.default_listen_port,
         config.default_expiry_hours,

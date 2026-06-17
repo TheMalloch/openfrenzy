@@ -2,7 +2,7 @@
 # setup-coord.sh — Clean install / reset for the meshlink coordination server.
 #
 # Wipes all previous state (config, database, runtime dirs) and configures fresh.
-# Requires the Go coord binary already present at /usr/local/bin/coord.
+# Requires the meshlink binary already present at /usr/local/bin/meshlink.
 #
 # Usage:  sudo ./scripts/setup-coord.sh
 #
@@ -18,8 +18,8 @@ fail() { echo -e "${RED}  fail${NC} $*"; exit 1; }
 # ── Root check ────────────────────────────────────────────────────────────────
 [[ $EUID -ne 0 ]] && fail "must be run as root (sudo $0)"
 
-COORD_BIN="/usr/local/bin/coord"
-[[ -x "$COORD_BIN" ]] || fail "coord binary not found at $COORD_BIN — build and install it first"
+COORD_BIN="/usr/local/bin/meshlink"
+[[ -x "$COORD_BIN" ]] || fail "meshlink binary not found at $COORD_BIN — build and install it first"
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 GROUP_NAME="meshlink"
@@ -27,7 +27,6 @@ USER_NAME="meshlink"
 CONFIG_DIR="/etc/meshlink"
 COORD_CONF="$CONFIG_DIR/coord.toml"
 STATE_DIR="/var/lib/meshlink"
-DB_PATH="$STATE_DIR/coord.db"
 UPDATES_DIR="$STATE_DIR/updates"
 RUNTIME_DIR="/run/meshlink"
 SERVICE_NAME="meshlink-coord"
@@ -49,10 +48,9 @@ fi
 
 # ── 2. Purge previous state ───────────────────────────────────────────────────
 log "purging previous configuration and state..."
-rm -f  "$COORD_CONF"                && ok "removed $COORD_CONF"
-rm -f  "$DB_PATH"                   && ok "removed $DB_PATH"
-rm -rf "$UPDATES_DIR"               && ok "removed $UPDATES_DIR"
-rm -f  "$RUNTIME_DIR/coord.sock"    2>/dev/null; true
+rm -f  "$COORD_CONF"             && ok "removed $COORD_CONF"
+rm -rf "$UPDATES_DIR"            && ok "removed $UPDATES_DIR"
+rm -f  "$RUNTIME_DIR/coord.sock" 2>/dev/null; true
 
 # ── 3. Create system user and group ──────────────────────────────────────────
 log "ensuring system user/group '$USER_NAME'..."
@@ -72,10 +70,10 @@ fi
 
 # ── 4. Create directories ─────────────────────────────────────────────────────
 log "creating directories..."
-install -d -m 0750 -o root    -g "$GROUP_NAME" "$CONFIG_DIR"
-install -d -m 0750 -o root    -g "$GROUP_NAME" "$STATE_DIR"
-install -d -m 0750 -o root    -g "$GROUP_NAME" "$UPDATES_DIR"
-install -d -m 0755 -o root    -g "$GROUP_NAME" "$RUNTIME_DIR"
+install -d -m 0750 -o root -g "$GROUP_NAME" "$CONFIG_DIR"
+install -d -m 0750 -o root -g "$GROUP_NAME" "$STATE_DIR"
+install -d -m 0750 -o root -g "$GROUP_NAME" "$UPDATES_DIR"
+install -d -m 0755 -o root -g "$GROUP_NAME" "$RUNTIME_DIR"
 ok "directories ready"
 
 # ── 5. Prompt for configuration ───────────────────────────────────────────────
@@ -85,18 +83,26 @@ echo "  Coordination server configuration"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
-# External address (mandatory — Cloudflare blocks UDP so must be bare IP)
-read -rp "  External address (bare VPS IP, NOT domain — UDP 4000 bypasses Cloudflare): " \
-    EXTERNAL_ADDRESS
+# External address (bare VPS IP for UDP — Cloudflare/CDN blocks UDP)
+read -rp "  External address (bare VPS IP for UDP, e.g. 1.2.3.4): " EXTERNAL_ADDRESS
 [[ -z "$EXTERNAL_ADDRESS" ]] && fail "external_address cannot be empty"
+
+# Caddy external domain (HTTPS subdomain for registration + HTTP fallback)
+read -rp "  Caddy external domain for HTTPS (e.g. mesh.example.com, leave blank to skip): " CADDY_DOMAIN
+CADDY_DOMAIN="${CADDY_DOMAIN:-}"
+
+# PostgreSQL database URL
+DEFAULT_DB="postgres:///meshlink?user=meshlink"
+read -rp "  PostgreSQL database URL [$DEFAULT_DB]: " DATABASE_URL
+DATABASE_URL="${DATABASE_URL:-$DEFAULT_DB}"
 
 # Mesh CIDR
 read -rp "  Mesh CIDR [10.0.0.0/24]: " MESH_CIDR
 MESH_CIDR="${MESH_CIDR:-10.0.0.0/24}"
 
 # HTTP port
-read -rp "  HTTP port [4001]: " HTTP_PORT
-HTTP_PORT="${HTTP_PORT:-4001}"
+read -rp "  HTTP port [443]: " HTTP_PORT
+HTTP_PORT="${HTTP_PORT:-443}"
 
 # UDP port
 read -rp "  UDP port [4000]: " UDP_PORT
@@ -112,50 +118,49 @@ if [[ "$ADMIN_TOKEN" == "$GEN_ADMIN" ]]; then
     echo "  (save this — you will need it for admin API calls)"
 fi
 
-# PASETO key for invite tokens
-echo ""
-GEN_PASETO=$(openssl rand -hex 32)
-read -rp "  PASETO invite key (leave blank to generate): " PASETO_KEY
-PASETO_KEY="${PASETO_KEY:-$GEN_PASETO}"
-if [[ "$PASETO_KEY" == "$GEN_PASETO" ]]; then
-    echo -e "  ${YELLOW}Generated PASETO key:${NC} $PASETO_KEY"
-    echo "  (save this — changing it invalidates existing invite tokens)"
-fi
-
 echo ""
 
 # ── 6. Write coord.toml ───────────────────────────────────────────────────────
 log "writing $COORD_CONF..."
+
+CADDY_SECTION=""
+if [[ -n "$CADDY_DOMAIN" ]]; then
+    CADDY_SECTION="
+[caddy]
+config_path = \"/etc/caddy/meshlink.conf\"
+admin_api   = \"http://localhost:2019\"
+external_domain = \"$CADDY_DOMAIN\""
+fi
+
 cat > "$COORD_CONF" <<EOF
 [database]
-path = "$DB_PATH"
+url = "$DATABASE_URL"
 
 [network]
 mesh_cidr = "$MESH_CIDR"
 
 [server]
-http_port = $HTTP_PORT
-udp_port = $UDP_PORT
-bind_address = "[::]"
+http_port        = $HTTP_PORT
+udp_port         = $UDP_PORT
+bind_address     = "[::]"
 external_address = "$EXTERNAL_ADDRESS"
 
 [admin]
 token = "$ADMIN_TOKEN"
 
-[invites]
-paseto_key = "$PASETO_KEY"
-
 [peers]
-stale_timeout_secs = 120
+stale_timeout_secs    = 120
 cleanup_interval_secs = 60
-default_listen_port = 51820
+default_listen_port   = 51820
 
 [logging]
 level = "info"
 
 [updates]
 dir = "$UPDATES_DIR"
+$CADDY_SECTION
 EOF
+
 chown "root:$GROUP_NAME" "$COORD_CONF"
 chmod 640 "$COORD_CONF"
 ok "$COORD_CONF written (root:$GROUP_NAME 640)"
@@ -175,8 +180,8 @@ ok "tmpfiles applied"
 log "writing $SERVICE_FILE..."
 cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=MeshLink Coordination Server (Go)
-After=network-online.target
+Description=MeshLink Coordination Server
+After=network-online.target postgresql.service
 Wants=network-online.target
 StartLimitIntervalSec=60s
 StartLimitBurst=3
@@ -186,9 +191,9 @@ Type=simple
 User=$USER_NAME
 Group=$GROUP_NAME
 
-ExecStart=$COORD_BIN
+ExecStart=$COORD_BIN cs --config $COORD_CONF start
 
-KillSignal=SIGINT
+KillSignal=SIGTERM
 TimeoutStopSec=15s
 
 Restart=on-failure
@@ -228,23 +233,28 @@ else
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────
+HTTPS_URL=""
+if [[ -n "$CADDY_DOMAIN" ]]; then
+    HTTPS_URL="https://$CADDY_DOMAIN"
+else
+    HTTPS_URL="http://$EXTERNAL_ADDRESS:$HTTP_PORT"
+fi
+
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo -e "${GREEN}coord server ready${NC}"
 echo ""
 echo "  Config:    $COORD_CONF"
-echo "  Database:  $DB_PATH"
-echo "  HTTP:      http://$EXTERNAL_ADDRESS:$HTTP_PORT"
+echo "  HTTP API:  $HTTPS_URL"
 echo "  UDP:       $EXTERNAL_ADDRESS:$UDP_PORT"
 echo ""
 echo "  Create an invite token:"
-echo "    $COORD_BIN --create-invite"
+echo "    $COORD_BIN cs --config $COORD_CONF create-invite"
 echo ""
 echo "  Peer registration (on each peer machine):"
-echo "    sudo meshlink up --server http://$EXTERNAL_ADDRESS:$HTTP_PORT \\"
-echo "                     --coord-server $EXTERNAL_ADDRESS:$UDP_PORT \\"
-echo "                     --invite <token>"
+echo "    sudo meshlink up \\"
+echo "      --server $HTTPS_URL \\"
+echo "      --invite <token>"
 echo ""
 echo "  Logs:  journalctl -u $SERVICE_NAME -f"
-echo "  Peers: echo 'list-peers' | socat - UNIX-CONNECT:$RUNTIME_DIR/coord.sock"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

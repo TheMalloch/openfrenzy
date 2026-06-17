@@ -9,6 +9,27 @@ use tokio::sync::mpsc;
 use tokio::time::{interval, sleep, timeout, Duration};
 use tracing::{debug, info, warn};
 
+#[derive(Clone)]
+pub(crate) struct HttpFallback {
+    client: reqwest::Client,
+    api_url: String,
+    auth_token: String,
+}
+
+#[derive(serde::Deserialize)]
+struct HttpPeerEntry {
+    public_key: String,
+    virtual_ip: String,
+    endpoint: Option<String>,
+    lan_endpoint: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct HttpKeepaliveBody<'a> {
+    listen_port: u16,
+    lan_ips: &'a [String],
+}
+
 /// Protocol message types for coordination server communication.
 mod proto {
     /// Register with coord server: [0x30][pub_key: 32][listen_port: 2]
@@ -167,15 +188,9 @@ fn parse_peer_list(data: &[u8]) -> Result<Vec<DiscoveredPeer>> {
 
 /// Task: periodic peer discovery and keepalive with the coordination server.
 ///
-/// 1. Register ourselves on startup
-/// 2. Periodically request peer list
-/// 3. For new peers, attempt hole punching then handshake
-/// 4. Send keepalives to maintain our registration
-/// 5. Handle unsolicited peer list pushes from the server
-///
-/// Coord protocol responses (0x11 NAT, 0x32 peer list) arrive via `coord_rx`,
-/// dispatched by `udp_reader_task`. This task only *sends* on the socket.
-pub async fn discovery_task(
+/// Primary path: UDP binary protocol (registration, peer list, keepalive, hole punching).
+/// Fallback path: HTTPS polling via `api_url` when UDP becomes unreachable.
+pub(crate) async fn discovery_task(
     state: SharedState,
     identity: Arc<Identity>,
     socket: Arc<UdpSocket>,
@@ -184,6 +199,7 @@ pub async fn discovery_task(
     config_path: std::path::PathBuf,
     virtual_ip: Ipv4Addr,
     mut coord_rx: mpsc::Receiver<RoutedPacket>,
+    http_fallback: Option<HttpFallback>,
 ) {
     let our_pub_key = identity.public_key_bytes();
     let lan_ips = get_lan_ips(virtual_ip);
@@ -224,30 +240,61 @@ pub async fn discovery_task(
     let mut keepalive_interval = interval(Duration::from_secs(25));
     let mut reregister_interval = interval(Duration::from_secs(300)); // 5 minutes
 
+    // Fallback state: consecutive UDP failures before switching, retry UDP every 5 min in fallback.
+    const UDP_FAIL_THRESHOLD: u32 = 3;
+    let mut udp_consecutive_failures: u32 = 0;
+    let mut using_http_fallback = false;
+    let mut http_retry_interval = interval(Duration::from_secs(300));
+
     loop {
         tokio::select! {
             _ = discovery_interval.tick() => {
-                // Request peer list
-                let req = build_peer_list_req(&our_pub_key);
-                if let Err(e) = socket.send_to(&req, coord_addr).await {
-                    warn!(error = %e, "failed to send peer list request");
+                if using_http_fallback {
+                    if let Some(ref fb) = http_fallback {
+                        http_fetch_peers(fb, &our_pub_key, &state, &identity, &socket, &config_path).await;
+                    }
                     continue;
                 }
 
-                // Wait for peer list response on the coord channel
-                match timeout(Duration::from_secs(5), recv_peer_list(&mut coord_rx)).await {
-                    Ok(Some(data)) => {
-                        process_peer_list_data(&data, &our_pub_key, &state, &identity, &socket, &config_path).await;
+                // UDP peer list request
+                let req = build_peer_list_req(&our_pub_key);
+                if let Err(e) = socket.send_to(&req, coord_addr).await {
+                    warn!(error = %e, "failed to send peer list request");
+                    udp_consecutive_failures += 1;
+                } else {
+                    match timeout(Duration::from_secs(5), recv_peer_list(&mut coord_rx)).await {
+                        Ok(Some(data)) => {
+                            udp_consecutive_failures = 0;
+                            process_peer_list_data(&data, &our_pub_key, &state, &identity, &socket, &config_path).await;
+                        }
+                        Ok(None) => debug!("coord channel closed"),
+                        Err(_) => {
+                            debug!("peer list request timed out");
+                            udp_consecutive_failures += 1;
+                        }
                     }
-                    Ok(None) => {
-                        debug!("coord channel closed");
-                    }
-                    Err(_) => {
-                        debug!("peer list request timed out");
+                }
+
+                if udp_consecutive_failures >= UDP_FAIL_THRESHOLD {
+                    if http_fallback.is_some() {
+                        warn!(failures = udp_consecutive_failures, "UDP coord unreachable, switching to HTTP fallback");
+                        using_http_fallback = true;
+                    } else {
+                        warn!(failures = udp_consecutive_failures, "UDP coord unreachable, no HTTP fallback configured");
+                        udp_consecutive_failures = 0; // reset so we keep logging periodically
                     }
                 }
             }
             _ = keepalive_interval.tick() => {
+                if using_http_fallback {
+                    if let Some(ref fb) = http_fallback {
+                        let current_lan_ips: Vec<String> = get_lan_ips(virtual_ip)
+                            .iter().map(|ip| ip.to_string()).collect();
+                        http_send_keepalive(fb, listen_port, &current_lan_ips).await;
+                    }
+                    continue;
+                }
+
                 let current_lan_ips = get_lan_ips(virtual_ip);
                 let msg = build_keepalive(&our_pub_key, &current_lan_ips);
                 if let Err(e) = socket.send_to(&msg, coord_addr).await {
@@ -289,8 +336,130 @@ pub async fn discovery_task(
                     process_peer_list_data(&pkt.data, &our_pub_key, &state, &identity, &socket, &config_path).await;
                 }
             }
+            // Periodically retry UDP while in fallback mode
+            _ = http_retry_interval.tick(), if using_http_fallback => {
+                let reg_msg = build_register_msg(&our_pub_key, listen_port, &get_lan_ips(virtual_ip));
+                match socket.send_to(&reg_msg, coord_addr).await {
+                    Ok(_) => {
+                        info!("UDP coord reachable again, leaving HTTP fallback");
+                        using_http_fallback = false;
+                        udp_consecutive_failures = 0;
+                    }
+                    Err(e) => {
+                        debug!(error = %e, "UDP coord still unreachable, staying in HTTP fallback");
+                    }
+                }
+            }
         }
     }
+}
+
+/// Send a keepalive via HTTPS.
+async fn http_send_keepalive(fb: &HttpFallback, listen_port: u16, lan_ips: &[String]) {
+    let body = HttpKeepaliveBody { listen_port, lan_ips };
+    let url = format!("{}/api/v1/node/keepalive", fb.api_url);
+    if let Err(e) = fb.client
+        .post(&url)
+        .bearer_auth(&fb.auth_token)
+        .json(&body)
+        .send()
+        .await
+    {
+        warn!(error = %e, "HTTP keepalive failed");
+    }
+}
+
+/// Fetch peer list via HTTPS and process any discovered peers.
+async fn http_fetch_peers(
+    fb: &HttpFallback,
+    our_pub_key: &[u8; 32],
+    state: &SharedState,
+    identity: &Identity,
+    socket: &Arc<UdpSocket>,
+    config_path: &std::path::Path,
+) {
+    let url = format!("{}/api/v1/node/peers", fb.api_url);
+    let resp = match fb.client
+        .get(&url)
+        .bearer_auth(&fb.auth_token)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "HTTP peer list request failed");
+            return;
+        }
+    };
+
+    let entries: Vec<HttpPeerEntry> = match resp.json().await {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(error = %e, "failed to parse HTTP peer list");
+            return;
+        }
+    };
+
+    let mut changed = false;
+    let mut seen_keys: Vec<[u8; 32]> = Vec::new();
+
+    for entry in &entries {
+        let pub_key_bytes = match base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            &entry.public_key,
+        ) {
+            Ok(b) if b.len() == 32 => b,
+            _ => continue,
+        };
+        let mut pub_key = [0u8; 32];
+        pub_key.copy_from_slice(&pub_key_bytes);
+
+        if pub_key == *our_pub_key {
+            continue;
+        }
+        seen_keys.push(pub_key);
+
+        let virtual_ip: Ipv4Addr = match entry.virtual_ip.parse() {
+            Ok(ip) => ip,
+            Err(_) => continue,
+        };
+        let endpoint: SocketAddr = match entry.endpoint.as_deref().and_then(|s| s.parse().ok()) {
+            Some(ep) => ep,
+            None => continue,
+        };
+        let lan_endpoint: Option<SocketAddr> = entry.lan_endpoint.as_deref()
+            .and_then(|s| s.parse().ok());
+
+        let discovered = DiscoveredPeer { public_key: pub_key, virtual_ip, endpoint, lan_endpoint };
+        let was_new = process_discovered_peer(state, identity, socket, &discovered).await;
+        if was_new {
+            changed = true;
+        }
+    }
+
+    // Remove peers absent from the HTTP list
+    let current_keys: Vec<[u8; 32]> = state.peers.read().await.keys().copied().collect();
+    for key in &current_keys {
+        if !seen_keys.contains(key) {
+            state.remove_peer(key).await;
+            changed = true;
+        }
+    }
+
+    if changed {
+        rewrite_config_peers(config_path, state).await;
+    }
+}
+
+/// Build an `HttpFallback` from optional config values. Returns `None` if either field is absent.
+pub(crate) fn build_http_fallback(api_url: Option<String>, auth_token: Option<String>) -> Option<HttpFallback> {
+    let api_url = api_url?;
+    let auth_token = auth_token?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .ok()?;
+    Some(HttpFallback { client, api_url, auth_token })
 }
 
 /// Process a raw peer list response: parse, update state, rewrite config.
@@ -407,12 +576,13 @@ async fn process_discovered_peer(
     let existing = state.get_peer(&discovered.public_key).await;
     let is_new;
 
-    if existing.is_some() {
-        // Peer already known — just update endpoint
+    if let Some(ref existing_peer) = existing {
+        let old_endpoint = existing_peer.endpoint;
         state
             .set_peer_endpoint(&discovered.public_key, effective_endpoint)
             .await;
-        is_new = false;
+        // Treat an endpoint change as a state change so the config file gets rewritten.
+        is_new = old_endpoint != Some(effective_endpoint);
     } else if !discovered.virtual_ip.is_unspecified() {
         // New peer with a valid virtual IP — add to state
         let allowed_ip: ipnet::Ipv4Net = format!("{}/32", discovered.virtual_ip)
