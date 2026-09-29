@@ -10,8 +10,8 @@ is auditable by one person.
 
 ## Why
 
-Core meshlink is 8.8k lines across two binaries, and `coord/api.rs` alone is
-1127 lines serving 21 routes — of which registration and peer-list are the only
+Core meshlink is 9.8k lines across two binaries, and `coord/api.rs` alone is
+1229 lines serving 19 routes — of which registration and peer-list are the only
 ones the mesh needs. Phase 1 rewrites the trust model. You cannot safely rewrite
 a trust model across a surface you cannot read in one sitting.
 
@@ -77,11 +77,15 @@ workspace edit, not a refactor.
   `coord/api.rs`, plus their handlers (`publish_update`, `get_latest_update`,
   `download_latest_binary`, `list_updates`).
 - Drop `update_store` from `coord/mod.rs`.
-- The `updates` table can stay in the schema for now; migrating it out is a
-  separate concern from removing the code path.
+- The `updates` table (including its `signature` column) can stay in the
+  schema for now; migrating it out is a separate concern from removing the
+  code path.
+- Update signing moves with it: `mldeploy keygen`, `push-update --key`, the
+  pinned-key check in `auto-update`, and the `X-Update-Signature` handling in
+  `publish_update`. Keep uploads admin-only and signature-required in meshops.
 
 ### 0.3 — Move the admin UI
-- `meshlink/src/coord/admin_html.rs` (431 lines) → meshops, as a static asset or
+- `meshlink/src/coord/admin_html.rs` (438 lines) → meshops, as a static asset or
   a small separate service.
 - Remove routes `/admin`, `/admin/`, `/api/v1/admin/services`,
   `/api/v1/admin/stream` and their handlers.
@@ -107,7 +111,7 @@ workspace edit, not a refactor.
 Not a move, but it belongs here because it changes a data structure Phase 1
 touches. See [`backlog.md`](../backlog.md) for the bug detail.
 
-`state.rs:66` inserts only `net.addr()` per `allowed_ips` entry, so a `/24`
+`state.rs:142` (in `add_peer`) inserts only `net.addr()` per `allowed_ips` entry, so a `/24`
 route only matches its network address. Either:
 - **(a)** restrict `allowed_ips` to `/32`, validate it at config load, document
   it — simplest, matches how the mesh is actually used; or
@@ -142,7 +146,7 @@ Do not do these here, however tempting:
 - **Touching the enrollment trust model.** Server-side key generation stays
   exactly as-is until Phase 2. Moving code and changing behaviour in the same
   pass makes the diff unreviewable.
-- **Rewriting `discovery/mod.rs`** (678 lines). It is big but it is mesh-core,
+- **Rewriting `discovery/mod.rs`** (916 lines, about a quarter of it tests). It is big but it is mesh-core,
   and Phase 1 rewrites much of it anyway.
 - **Reformatting or renaming** beyond what the moves require.
 

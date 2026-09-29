@@ -19,17 +19,19 @@ CLI around today's model means designing it twice.
 
 ## Current state
 
-`GUIDE.md` is 321 lines across eight numbered sections. A first-time user must
-read most of it: database creation, keypair generation, invite creation, port
-opening, node registration — before two machines can ping each other.
+`GUIDE.md` is ~460 lines across ten numbered sections. A first-time user must
+read most of it: database creation, `coord.toml` (with the easy-to-miss
+`external_address`), Caddy, invite creation, port opening, node registration —
+before two machines can ping each other.
 
-`meshlink/src/main.rs` is 706 lines and mixes CLI dispatch, daemonization,
+`meshlink/src/main.rs` is 745 lines and mixes CLI dispatch, daemonization,
 registration, and the daemon runtime.
 
 What already exists and is good:
 - `main.rs::wrap_permission_error` — the right instinct, applied in one place.
-- `state.rs` tracks `tx_bytes`/`rx_bytes` per peer, which `status` underuses.
-- `cli/mod.rs` has a unix-socket control channel at `/var/run/meshlink.sock`.
+- `state.rs` tracks per-peer traffic (`PeerStats`), which `status` underuses.
+- `cli/mod.rs` has a unix-socket control channel at `/run/meshlink/meshlink.sock`
+  (`/var/run/meshlink.sock` outside systemd).
 
 ## Tasks
 
@@ -75,8 +77,9 @@ and the answer is almost always visible in per-peer handshake state.
 Requires Phase 1: "handshake: never" is only meaningful once handshakes exist.
 
 ### 3.3 — Coordinator setup in one command
-Today: create the database, create the user, export `DATABASE_URL`, run
-`db-setup`, generate a keypair, create an invite, open two firewall ports, start.
+Today: create the database and user, write `coord.toml` (setting
+`external_address`), configure Caddy, run `db-setup`, create an invite, open
+two firewall ports, start.
 
 Target: `meshlink cs init` does the reachable parts and prints exactly what it
 cannot do itself (firewall rules, DNS), then prints the first invite code and
@@ -86,14 +89,16 @@ the exact `meshlink up` line to run on a node. Copy-paste to a working mesh.
 Audit every `anyhow::bail!` and `.context(...)` in the tree. Each should say what
 went wrong *and* what to do. Extend the `wrap_permission_error` pattern:
 
-- TUN creation denied → suggest `setcap cap_net_admin+ep` (already in
-  GUIDE.md:314, should be in the error).
+- TUN creation denied → suggest `setcap cap_net_admin+ep` (already in the
+  GUIDE.md Notes, should be in the error).
+- Coordinator started without `external_address` → nodes are told to use
+  `0.0.0.0:4000`. Refuse to start, or warn loudly.
 - Coordinator unreachable → show the resolved address and the port, and whether
   it was DNS, connection refused, or timeout.
 - Invite rejected → distinguish expired, exhausted, and unknown.
 
 ### 3.5 — Trim `main.rs`
-706 lines mixing four responsibilities. Split CLI dispatch, enrollment, and
+745 lines mixing four responsibilities. Split CLI dispatch, enrollment, and
 daemon runtime. Do this *driven by* the UX changes above, not as a separate
 refactor — otherwise it will not converge.
 
@@ -101,12 +106,17 @@ refactor — otherwise it will not converge.
 - `readme.md`: what it is, the security model as it actually stands after Phases
   1-2, and a five-line quick start.
 - `GUIDE.md`: sections 2 and 3 (node setup, quick example) are the happy path
-  and go first. Static configuration (section 4) is an appendix.
+  and go first. Static configuration (section 7), the peer API (§6) and
+  `mldeploy` (§8) are appendices.
 - Delete instructions the tooling now handles itself.
 
 ### 3.7 — Installer
-`install.sh` currently has uncommitted local changes — reconcile before starting.
-It should detect the platform, install the binary, and stop. Enrollment is
+There are two installers: `install.sh` (writes its own units, `coord.toml`
+based) and the older `systemd/install-systemd.sh` (installs the unit files in
+`systemd/`, `coord.env` based). Running the second after the first replaces
+the units with different ones. Keep one. `install.sh` also does not install
+`mldeploy`. The installer should detect the platform, install the binaries,
+and stop. Enrollment is
 `meshlink up`'s job, not the installer's.
 
 ## Acceptance criteria

@@ -25,37 +25,38 @@ once against Noise sessions.
 ## Current state
 
 ### The hole
-`meshlink/src/coord/udp_handler.rs:297` — `handle_register`:
+`meshlink/src/coord/udp_handler.rs:448` — `handle_register`:
 
 ```rust
-if data.len() < 35 { return; }
 let mut public_key = [0u8; 32];
 public_key.copy_from_slice(&data[1..33]);
 let listen_port = u16::from_be_bytes([data[33], data[34]]);
+let (lan_ip, caps) = parse_tail(data, 35);
+let Some(node) = known_node(database, &public_key).await else { return; };
 ```
 
-...and then, with no further checks, it inserts into the peer map with
-`endpoint: src`, calls `database.update_endpoint_by_pubkey(...)`, and if the
-peer is new, `broadcast_peer_list(...)` to the whole mesh.
+`known_node` only checks that the key is enrolled and not disabled. After that
+the handler updates the peer map with `endpoint: src`, persists it via
+`persist_endpoints`, and if the peer is new, broadcasts the peer list mesh-wide.
 
 There is no proof that the sender holds the private key for the public key it
-presented. Invite codes gate the **HTTP** enrollment path only; the UDP path has
-no gate at all. `handle_keepalive` (line 426) has the same shape.
+presented; public keys are in every peer list. Invite codes gate the **HTTP**
+enrollment path only. `handle_keepalive` (line 542) has the same shape.
 
 ### The trust problem
-`coord/api.rs:338` generates the node's keypair server-side by default, and
-`coord/api.rs:388` stores the private key via
+`coord/api.rs:363` generates the node's keypair server-side by default, and
+`coord/api.rs:413` stores the private key via
 `private_key_opt.map(|k| k.to_vec())` into
 `meshlink/src/coord/db.rs::setup_tables`'s `private_key_encrypted BYTEA NOT NULL`.
 
 **The column name is wrong** — the bytes are stored raw, not encrypted.
 
-`GUIDE.md:313` documents server-side generation as a feature. After Phase 1 this
-becomes the weakest link: traffic is encrypted, but the server can decrypt all of
+`GUIDE.md` (§2 and Notes) warns that the server stores private keys and
+recommends `--public-key`. After Phase 1 this becomes the weakest link: traffic is encrypted, but the server can decrypt all of
 it and impersonate any node.
 
 ### The good news: BYOK already exists
-`coord/api.rs:315` already branches on a client-supplied `public_key`:
+`coord/api.rs:341` already branches on a client-supplied `public_key`:
 
 ```rust
 let (private_key_opt, public_key): (Option<[u8; 32]>, [u8; 32]) =
@@ -65,7 +66,8 @@ let (private_key_opt, public_key): (Option<[u8; 32]>, [u8; 32]) =
 
 `coord/config_generator.rs:15` already handles the empty-private-key case, and
 `api_client.rs:52` already plumbs the parameter. It is reachable today only via
-a manual `--public-key` flag on `meshlink up` (`main.rs:54`), so nobody uses it.
+a manual `--public-key` flag on `meshlink up` (`cli/mod.rs:46`), which the
+generated config does not fill in, so almost nobody uses it.
 
 **This phase flips the default and deletes the other branch.** It is not new
 construction.
@@ -116,12 +118,12 @@ sudo meshlink up --server ... --invite CODE --name laptop
 - `main.rs`: generate an identity locally before registering; always send the
   public key. Remove the `--public-key` flag's special-case role (it may stay as
   a way to supply an existing key).
-- `coord/api.rs:315`: delete the `else` branch that calls
+- `coord/api.rs:341`: delete the `else` branch that calls
   `key_manager::generate_node_keypair()`. Registration without a `public_key`
   becomes a 400.
 - Delete `coord/key_manager.rs` and its export from `coord/mod.rs`.
-- `coord/api.rs:161,423-450`: remove `private_key` from the registration
-  response type and its base64 encoding.
+- `coord/api.rs:160` and the `private_key_b64` block (`:452`): remove
+  `private_key` from the registration response type and its base64 encoding.
 - `coord/config_generator.rs`: the private-key line is now always omitted —
   simplify, don't just leave the branch dead.
 
@@ -141,18 +143,25 @@ sudo meshlink up --server ... --invite CODE --name laptop
   peer map or the database.
 - Same for `handle_keepalive`.
 - `handle_peer_list_req` (`0x31`) should also be authenticated — the peer list
-  is not public information.
+  is not public information. Today it is only bound to the address the key
+  last registered from (`udp_handler.rs:495`), which an attacker who registers
+  that key from their own address satisfies.
 
 ### 2.4 — Version the protocol
-Adding fields to `0x30`/`0x33` breaks old nodes. Add a version byte or use new
-message types (`0x34`/`0x35`) and support both for one release. Decide, and
-write it here — an unversioned flag day will hurt.
+Adding fields to `0x30`/`0x33` breaks old nodes. A mechanism already exists:
+REGISTER and KEEPALIVE end with a capability byte (`caps`, `CAP_CHUNKED =
+0x01` today), which is how chunked peer lists were rolled out compatibly.
+`0x34` is taken (`PEER_LIST_CHUNK`). Either define a new caps bit for signed
+messages plus new types from `0x35`, or bump to a versioned format, and
+support both for one release. Decide, and write it here — an unversioned flag
+day will hurt.
 
 ### 2.5 — Update the docs
-- `GUIDE.md:313` — the "server generates keypairs" note becomes false. Replace
-  it with the stronger, now-true statement: the server never sees a private key.
-- `readme.md` — "encryption planned" is no longer accurate after Phase 1;
-  document the real security model across both phases.
+- `GUIDE.md` §2 and Notes — the "server stores private keys" warning becomes
+  false. Replace it with the stronger, now-true statement: the server never
+  sees a private key. Drop the `--public-key` workaround.
+- `readme.md` "Security status" and `GUIDE.md`'s banner — rewrite them to
+  describe the real security model after both phases.
 
 ## Acceptance criteria
 

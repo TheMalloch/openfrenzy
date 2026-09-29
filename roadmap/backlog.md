@@ -7,7 +7,7 @@ being deferred. Revisit after Phase 3.
 
 ## `allowed_ips` subnet routes silently do not work
 
-`meshlink/src/state.rs:59-70`, `add_peer`:
+`meshlink/src/state.rs:131-150`, `add_peer`:
 
 ```rust
 for net in &info.allowed_ips {
@@ -18,7 +18,7 @@ for net in &info.allowed_ips {
 Only the network address of each `allowed_ips` entry is inserted into the route
 table. For a `/32` that is correct. For a `/24`, only `x.x.x.0` gets a route —
 every other address in the range has no route and `outbound_router_task` drops
-the packet at `router/mod.rs:56`.
+the packet at `router/mod.rs:53` (`outbound_target` returns `None`).
 
 Either restrict `allowed_ips` to `/32` and validate at config load, or replace
 the `HashMap<Ipv4Addr, PeerPublicKey>` with a longest-prefix-match trie.
@@ -46,9 +46,11 @@ is only visible once sessions exist. Pre-refactoring it would be guessing.
 
 ## `peer_api` security is on the wrong plane
 
-`peer_api/` has mTLS (`tls.rs`), a replay/nonce store (`replay.rs`),
-constant-time token comparison (`auth.rs:61`), and per-IP rate limiting with
-lockout (`auth.rs:20-58`). This is real, careful security engineering.
+`peer_api/` has mTLS (`tls.rs`), constant-time token comparison
+(`util.rs:44`, shared with the coordinator), and per-IP rate limiting with
+lockout and pruning (`auth.rs:19-58`). This is real, careful security
+engineering. (A replay/nonce store existed but was never called; it was
+removed.)
 
 It is all on the node's management HTTP API. None of it was on the data plane.
 
@@ -76,9 +78,11 @@ explicitly rather than letting it be forgotten.
 `router/mod.rs::extract_dest_ip` and `extract_src_ip` both check
 `version != 4` and drop anything else. IPv6 inside the tunnel is unsupported.
 
-Note that IPv6 *endpoints* are supported — `coord/udp_handler.rs` stores
-`ipv6_endpoint`, and `normalize_addr` handles IPv4-mapped addresses. It is only
-the tunnelled payload that is v4-only.
+IPv6 *endpoints* are partly supported — `coord/udp_handler.rs` stores
+`ipv6_endpoint` separately and advertises a peer's IPv4 endpoint in
+preference, and `normalize_addr` handles IPv4-mapped addresses. Nodes still
+skip peers whose only endpoint is IPv6 (`discovery/mod.rs`,
+`process_discovered_peer`). The tunnelled payload is v4-only.
 
 Deferred: this is a feature, not a security issue, and it touches the same code
 Phase 1 rewrites. Doing both at once makes the security diff harder to review.
@@ -88,7 +92,7 @@ Phase 1 rewrites. Doing both at once makes the security diff harder to review.
 ## `private_key_encrypted` column name
 
 `meshlink/src/coord/db.rs::setup_tables` declares `private_key_encrypted BYTEA NOT NULL`, but
-`coord/api.rs:388` writes `private_key_opt.map(|k| k.to_vec())` — raw, unencrypted
+`coord/api.rs:413` writes `private_key_opt.map(|k| k.to_vec())` — raw, unencrypted
 key bytes. The name suggests a protection that does not exist.
 
 **Resolved by Phase 2 task 2.2**, which drops the column entirely. Listed here so

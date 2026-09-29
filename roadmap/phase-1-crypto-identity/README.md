@@ -24,27 +24,27 @@ So: **the AEAD tag is the identity proof.** One mechanism, one phase.
 
 ### The good news
 `meshlink/src/state.rs` is already shaped correctly. `PeerInfo` is keyed by
-`PeerPublicKey = [u8; 32]`, and the route table is `Ipv4Addr -> PeerPublicKey`.
-Identity degrades to "address" in exactly one place. This is a much smaller
+`PeerPublicKey = [u8; 32]`, the route table is `Ipv4Addr -> PeerPublicKey`,
+and per-peer counters are lock-free (`Arc<PeerStats>`). Identity degrades to
+"address" in exactly one place: the endpoint index. This is a much smaller
 blast radius than the codebase size suggests.
 
 ### The hole
-`meshlink/src/router/mod.rs:133-142`:
+`meshlink/src/router/mod.rs:124-137` calls
+`SharedState::inbound_verdict` (`state.rs:188`):
 
 ```rust
-let peer_key = {
-    let peers = state.peers.read().await;
-    match peers.values().find(|p| p.endpoint == Some(src)) {
-        Some(p) => p.public_key,
-        None => { debug!(%src, "data packet from unknown endpoint"); return; }
-    }
+let Some(key) = self.endpoints.read().await.get(&src).copied() else {
+    return InboundVerdict::UnknownEndpoint;
 };
+// ...then checks the inner source IP against peers[key].allowed_ips
 ```
 
-Identity is whoever last registered from this address. The `allowed_ips` check
-that follows (line 147-158) validates the packet's inner source IP against the
-*claimed* peer's allowed ranges — so it constrains an attacker to impersonating
-one specific peer at a time, and nothing more.
+`endpoints` is a `SocketAddr -> PeerPublicKey` index kept in sync by
+`add_peer` / `set_peer_endpoint` / `remove_peer`. Identity is whoever last
+registered from this address. The `allowed_ips` check validates the packet's
+inner source IP against the *claimed* peer's allowed ranges — so it constrains
+an attacker to impersonating one specific peer at a time, and nothing more.
 
 ### The stub
 `meshlink/src/crypto/transport.rs`, in full, is 24 lines:
@@ -90,8 +90,9 @@ Replace the single type byte:
 0x04  transport           [0x04][receiver_session_id:4][counter:8][ciphertext][tag:16]
 ```
 
-`0x04` is deliberately kept as the transport type so the coordination protocol
-types (`0x10`, `0x11`, `0x30`-`0x33`) stay untouched — Phase 2 handles those.
+`0x04` is deliberately kept as the transport type so the other protocol types
+(`0x10`, `0x11`, `0x20` hole punch, `0x30`-`0x34`) stay untouched — Phase 2
+handles the coordination ones.
 
 Counter is the Noise nonce, sent explicitly so the receiver can handle
 reordering. 64-bit, never reused within a session.
@@ -175,7 +176,8 @@ Sequenced. Each is independently testable.
 - Session exists → `session.encrypt()`, frame, send.
 
 ### 1.7 — Inbound path (`router/mod.rs::handle_data_packet`) — **the security fix**
-Replace the endpoint-matching block entirely:
+Replace the endpoint lookup (`SharedState::inbound_verdict` and the
+`endpoints` index) entirely:
 
 ```
 1. parse frame, extract receiver_session_id and counter
@@ -193,7 +195,8 @@ them as "unknown packet type".
 ### 1.8 — Endpoint roaming
 Once step 5 yields a proven identity, a packet arriving from a new source
 address for an established session is a legitimate NAT rebind. Authenticate
-first, then update `peer.endpoint` from the packet source.
+first, then update the endpoint from the packet source via
+`SharedState::set_peer_endpoint` (it also maintains the endpoint index).
 
 Today this behaviour would be a vulnerability. After 1.7 it is a feature, and
 it is the payoff that makes the rewrite worth the effort: peers survive network
@@ -232,7 +235,7 @@ in the backlog if you defer it, do not silently skip it.
 
 ## Out of scope
 
-- **Coordination protocol auth** (`0x30`-`0x33`). Phase 2. The mesh is
+- **Coordination protocol auth** (`0x30`-`0x34`). Phase 2. The mesh is
   meaningfully secure after Phase 1 even with `REGISTER` still open: the worst an
   attacker can do is deny service, not read or inject traffic.
 - **Removing server-side key generation.** Phase 2. Phase 1 must work with

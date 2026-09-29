@@ -24,23 +24,24 @@ produced this roadmap:
    but there is no `diffie_hellman` call anywhere in the tree and no AEAD crate
    at all. Keypairs are used purely as names.
 
-2. **Peer identity is the UDP source address.** `meshlink/src/router/mod.rs:135`
-   attributes inbound packets via
-   `peers.values().find(|p| p.endpoint == Some(src))`. Spoof a source address and
-   you are that peer. The `allowed_ips` check on line 149 then validates against
-   the identity you claimed, so it protects nothing.
+2. **Peer identity is the UDP source address.** `meshlink/src/router/mod.rs:126`
+   attributes inbound packets via `SharedState::inbound_verdict`
+   (`state.rs:188`), which looks the source address up in an endpoint → key
+   index. Spoof a source address and you are that peer. The `allowed_ips` check
+   that follows validates against the identity you claimed, so it protects
+   nothing.
 
-3. **`REGISTER` is unauthenticated.** `meshlink/src/coord/udp_handler.rs:297`
-   takes a 35-byte UDP packet, reads bytes 1..33 as a public key, and
-   unconditionally overwrites that peer's endpoint in the peer map and the
-   database, then broadcasts the new peer list mesh-wide. No signature, no proof
-   of key ownership, no invite. Anyone who learns a node's public key can
-   redirect its traffic with one packet.
+3. **`REGISTER` is unauthenticated.** `meshlink/src/coord/udp_handler.rs:448`
+   takes a UDP packet, reads bytes 1..33 as a public key, checks only that the
+   key belongs to an enrolled, non-disabled node, then overwrites that peer's
+   endpoint in the peer map and the database. No signature, no proof of key
+   ownership. Anyone who learns a node's public key can redirect its traffic
+   with one packet.
 
 4. **The coordination server holds every node's private key.** Server-side
-   keypair generation is the default path (`coord/api.rs:338`), and
+   keypair generation is the default path (`coord/api.rs:363`), and
    `meshlink/src/coord/db.rs::setup_tables` stores it as `private_key_encrypted BYTEA NOT
-   NULL` — which is not encrypted; `coord/api.rs:388` writes raw bytes.
+   NULL` — which is not encrypted; `coord/api.rs:413` writes raw bytes.
 
 These are **one problem, not four**. Encrypting packets while still identifying
 peers by source address buys nothing. The AEAD session *is* the identity
@@ -49,16 +50,17 @@ cryptographic identity", and encryption falls out of it.
 
 ## Scale
 
-8.8k lines of Rust across two binaries. Largest files:
+9.8k lines of Rust across two binaries (grew from 8.8k with the
+review-findings fixes, mostly tests). Largest files:
 
 ```
-1127  meshlink/src/coord/api.rs
- 860  mldeploy/src/main.rs
- 706  meshlink/src/main.rs
- 678  meshlink/src/discovery/mod.rs
+1229  meshlink/src/coord/api.rs
+1018  mldeploy/src/main.rs
+ 916  meshlink/src/discovery/mod.rs
+ 745  meshlink/src/main.rs
+ 678  meshlink/src/coord/udp_handler.rs
+ 533  meshlink/src/coord/db.rs
  503  meshlink/src/coord/mod.rs
- 503  meshlink/src/coord/db.rs
- 501  meshlink/src/coord/udp_handler.rs
 ```
 
 Size is not the real problem; scope is. A LAN mesh tool has acquired a Caddy
@@ -103,6 +105,13 @@ Locked in. Do not relitigate inside a phase session without changing this file.
 - [ ] Phase 1 — Cryptographic identity and encrypted data plane
 - [ ] Phase 2 — Authenticated coordination
 - [ ] Phase 3 — Usability
+
+Outside the phases, the review-findings pass (branch `fix/review-findings`)
+fixed a set of adjacent bugs and hardening gaps: admin-only signed updates,
+Caddy/admin-UI injection, forged peer lists, peer-list chunking, HTTP fallback
+recovery, invite races. It does **not** change the four problems above; its
+interim mitigations and their limits are listed under "Residual risks" in
+[`backlog.md`](backlog.md).
 
 ## Working agreement for phase sessions
 
