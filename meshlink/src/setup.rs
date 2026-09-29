@@ -55,11 +55,12 @@ pub fn run_setup(config_dir: &Path) -> Result<()> {
         actions.push(format!("{config_str} already exists (skipped creation)"));
     }
 
-    // Set config file ownership and permissions (root:meshlink, 0664)
+    // Set config file ownership and permissions (root:meshlink, 0660).
+    // It holds the private key: never world-readable.
     chown(&config_str, "root", GROUP_NAME)?;
-    chmod(&config_str, "0664")?;
+    chmod(&config_str, "0660")?;
     actions.push(format!(
-        "Set {config_str} ownership to root:{GROUP_NAME} mode 0664"
+        "Set {config_str} ownership to root:{GROUP_NAME} mode 0660"
     ));
 
     // Fix credentials.json permissions if it exists

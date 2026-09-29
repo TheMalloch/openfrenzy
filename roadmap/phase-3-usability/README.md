@@ -92,7 +92,8 @@ went wrong *and* what to do. Extend the `wrap_permission_error` pattern:
 - TUN creation denied → suggest `setcap cap_net_admin+ep` (already in the
   GUIDE.md Notes, should be in the error).
 - Coordinator started without `external_address` → nodes are told to use
-  `0.0.0.0:4000`. Refuse to start, or warn loudly.
+  `0.0.0.0:4000`. It logs an error (`coord/mod.rs`) but still starts and hands
+  out the dead address; it should refuse to start instead.
 - Coordinator unreachable → show the resolved address and the port, and whether
   it was DNS, connection refused, or timeout.
 - Invite rejected → distinguish expired, exhausted, and unknown.
@@ -111,12 +112,10 @@ refactor — otherwise it will not converge.
 - Delete instructions the tooling now handles itself.
 
 ### 3.7 — Installer
-There are two installers: `install.sh` (writes its own units, `coord.toml`
-based) and the older `systemd/install-systemd.sh` (installs the unit files in
-`systemd/`, `coord.env` based). Running the second after the first replaces
-the units with different ones. Keep one. `install.sh` also does not install
-`mldeploy`. The installer should detect the platform, install the binaries,
-and stop. Enrollment is
+`install.sh` is the single installer (it writes the `meshlink-peer` /
+`meshlink-coord` units itself). It does not install `mldeploy` or its
+auto-update unit (`systemd/mldeploy-autoupdate.service`). The installer should
+detect the platform, install the binaries, and stop. Enrollment is
 `meshlink up`'s job, not the installer's.
 
 ## Acceptance criteria

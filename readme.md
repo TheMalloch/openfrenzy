@@ -67,7 +67,7 @@ meshlink/src/
     admin_html.rs      admin web UI (/admin)
     update_store.rs    update binaries on disk
 mldeploy/src/main.rs
-systemd/             unit files (see GUIDE.md)
+systemd/mldeploy-autoupdate.service   unit for the mldeploy auto-update daemon (GUIDE.md §8)
 install.sh           installer for peer or coordination server
 roadmap/             phased plan: security rewrite, scope split, usability
 ```

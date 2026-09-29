@@ -424,7 +424,7 @@ pub async fn run(config: CoordServerConfig) -> Result<()> {
             coord_server_addr = %config.coord_server_addr,
             "coord_server_addr is unroutable (0.0.0.0): peers will receive this as their \
              coordination server and be unable to reach it. Set [server] coord_addr or \
-             external_address in coord.toml (or COORD_SERVER_ADDR / EXTERNAL_ADDRESS in coord.env)."
+             external_address in coord.toml (or the COORD_SERVER_ADDR / EXTERNAL_ADDRESS environment variables)."
         );
     }
 

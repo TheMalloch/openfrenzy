@@ -759,7 +759,8 @@ async fn process_discovered_peer(
 ///
 /// Everything else in the file (other sections, comments, formatting) is kept.
 /// Static peers (`static = true`) are kept as written; discovered peers are
-/// replaced. The file is written atomically — it holds the private key.
+/// replaced. The file is written atomically and never world-readable — it
+/// holds the private key.
 async fn rewrite_config_peers(config_path: &std::path::Path, state: &SharedState) {
     let existing = match tokio::fs::read_to_string(config_path).await {
         Ok(s) => s,
@@ -789,7 +790,7 @@ async fn rewrite_config_peers(config_path: &std::path::Path, state: &SharedState
     let path = config_path.to_path_buf();
     let count = peers.len();
     let result = tokio::task::spawn_blocking(move || {
-        crate::util::write_atomic(&path, new_config.as_bytes(), 0o600)
+        crate::util::write_private(&path, new_config.as_bytes())
     })
     .await;
     match result {

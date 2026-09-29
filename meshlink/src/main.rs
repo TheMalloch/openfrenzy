@@ -87,8 +87,13 @@ fn main() -> Result<()> {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| wrap_permission_error(e, "creating config directory"))?;
             }
-            std::fs::write(&cli.config, &resp.config_toml)
-                .map_err(|e| wrap_permission_error(e, "writing config file"))?;
+            // Holds the private key and auth token: group-readable, never world.
+            util::write_private(&cli.config, resp.config_toml.as_bytes()).map_err(|e| {
+                match e.downcast::<std::io::Error>() {
+                    Ok(io) => wrap_permission_error(io, "writing config file"),
+                    Err(other) => other.context("writing config file"),
+                }
+            })?;
 
             println!("Registration successful!");
             println!("  Node ID:      {}", resp.node_id);
@@ -463,6 +468,22 @@ async fn run_daemon(
     info!("MeshLink starting");
 
     let mut config = config::Config::load(config_path)?;
+
+    // Older versions wrote these secret files world-readable; tighten them.
+    let secret_files = [
+        config_path.to_path_buf(),
+        config_path
+            .parent()
+            .unwrap_or(std::path::Path::new("/etc/meshlink"))
+            .join("credentials.json"),
+    ];
+    for path in &secret_files {
+        match util::restrict_other_access(path) {
+            Ok(true) => info!(path = %path.display(), "removed world access from secret file"),
+            Ok(false) => {}
+            Err(e) => warn!(path = %path.display(), error = %e, "could not restrict permissions on secret file"),
+        }
+    }
 
     // Override coordination server if provided via CLI
     if let Some(addr) = coord_server_override {

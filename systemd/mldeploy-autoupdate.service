@@ -1,10 +1,8 @@
 [Unit]
 Description=MeshLink Auto-Update Daemon
-Documentation=file:///home/openfrenzy/readme.md
+# Peer must be up so the mesh route to the coord server is reachable
 After=network-online.target meshlink-peer.service
 Wants=network-online.target
-# Peer must be up so the mesh route to the coord server is reachable
-After=meshlink-peer.service
 
 [Service]
 Type=simple

@@ -457,6 +457,10 @@ The coordination server needs UDP 4000 and its HTTP port (or 443 via Caddy).
   endpoints and virtual IP. Unless nodes registered with `--public-key`, it also
   **stores their private keys**. Tunnel traffic is not yet encrypted, so anyone
   on the path between nodes can read it.
+- `/etc/meshlink/config.toml` (private key, auth token) and `credentials.json`
+  hold secrets. They are `root:meshlink`, mode `0660`: readable by the
+  `meshlink` services, never by other users. The daemon removes any world
+  access it finds at startup.
 - TUN creation needs root or `CAP_NET_ADMIN`. `install.sh` sets the
   capabilities; by hand: `sudo setcap cap_net_admin+ep /usr/local/bin/meshlink`.
 - Only IPv4 is carried inside the tunnel. Nodes reachable only over IPv6 are
