@@ -41,7 +41,10 @@ echo ""
 echo "  1) peer  — node that joins the mesh"
 echo "  2) coord — coordination server"
 echo ""
-read -rp "  Install as [peer/coord]: " MODE_INPUT
+MODE_INPUT="${1:-${INSTALL_MODE:-}}"
+if [[ -z "$MODE_INPUT" ]]; then
+    read -rp "  Install as [peer/coord]: " MODE_INPUT
+fi
 echo ""
 
 case "${MODE_INPUT,,}" in
