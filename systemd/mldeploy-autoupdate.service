@@ -20,9 +20,16 @@ Group=meshlink
 #   --interval  seconds between checks (default 300)
 #   --dest      binary to replace on update (default /usr/local/bin/mldeploy)
 #   --post-cmd  optional shell command after a successful update
+#   --pubkey    pinned ed25519 key updates must be signed with
+#               (default /etc/meshlink/update.pub, from `mldeploy keygen`)
+#
+# Unsigned updates, or updates signed with another key, are refused.
+# When --dest is this binary and no --post-cmd is given, the daemon
+# re-execs itself after an update so the new version takes over.
 ExecStart=/usr/local/bin/mldeploy auto-update \
     --interval 300 \
-    --dest /usr/local/bin/mldeploy
+    --dest /usr/local/bin/mldeploy \
+    --pubkey /etc/meshlink/update.pub
 
 KillSignal=SIGTERM
 TimeoutStopSec=10s

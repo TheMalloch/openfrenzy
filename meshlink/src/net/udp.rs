@@ -49,14 +49,18 @@ pub async fn bind_udp(listen_port: u16) -> Result<(UdpSocket, u16)> {
 /// Task: read datagrams from UDP socket, dispatch by packet type.
 ///
 /// - `0x04` (data packets) → `data_tx` (to inbound router)
-/// - `0x11`, `0x32` (coord protocol responses) → `coord_tx` (to discovery task)
+/// - `0x11`, `0x32` (coord protocol responses) → `coord_tx` (to discovery task),
+///   only when they come from `coord_addr`
 /// - everything else → log and drop
 pub async fn udp_reader_task(
     socket: Arc<UdpSocket>,
     data_tx: mpsc::Sender<RoutedPacket>,
     coord_tx: mpsc::Sender<RoutedPacket>,
+    coord_addr: SocketAddr,
 ) {
-    let mut buf = vec![0u8; 4096];
+    let coord_addr = normalize_addr(coord_addr);
+    // Max UDP payload: large peer lists must not be silently truncated.
+    let mut buf = vec![0u8; 65536];
 
     loop {
         match socket.recv_from(&mut buf).await {
@@ -82,13 +86,26 @@ pub async fn udp_reader_task(
                     }
                     // Coord protocol responses: NAT detect resp (0x11), peer list resp (0x32)
                     0x11 | 0x32 => {
+                        // Anyone can send to our port; only the coordinator may
+                        // drive NAT detection or rewrite our peer table.
+                        if src_addr != coord_addr {
+                            trace!(%src_addr, msg_type = format!("0x{:02x}", first), "coord packet from non-coord source, dropping");
+                            continue;
+                        }
                         debug!(bytes = n, %src_addr, msg_type = format!("0x{:02x}", first), "UDP recv coord");
                         let packet = RoutedPacket {
                             data: buf[..n].to_vec(),
                             peer_endpoint: src_addr,
                         };
-                        if coord_tx.send(packet).await.is_err() {
-                            debug!("coord channel closed, dropping coord packet");
+                        // Never block the data plane on a busy discovery task.
+                        match coord_tx.try_send(packet) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                debug!("coord channel full, dropping coord packet");
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                debug!("coord channel closed, dropping coord packet");
+                            }
                         }
                     }
                     // Hole punch probe — log and drop

@@ -254,7 +254,7 @@ fn validate_admin_token(
         )
     })?;
 
-    if provided != *configured {
+    if !crate::util::token_eq(&provided, configured) {
         return Err((
             StatusCode::UNAUTHORIZED,
             Json(ErrorResponse {
@@ -267,6 +267,18 @@ fn validate_admin_token(
 }
 
 // --- Helpers ---
+
+/// Validate a user-supplied node name. It ends up in the Caddyfile and the
+/// admin UI, so only a conservative charset is allowed.
+fn sanitize_node_name(raw: &str) -> Option<String> {
+    let name = raw.trim();
+    let ok = !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    ok.then(|| name.to_string())
+}
 
 /// Regenerate Caddy config from DB and reload.
 async fn regen_caddy(state: &AppState) {
@@ -289,6 +301,20 @@ async fn register(
     State(state): State<AppState>,
     Json(req): Json<RegisterRequest>,
 ) -> impl IntoResponse {
+    let node_name = match req.node_name.as_deref() {
+        None => None,
+        Some(raw) => match sanitize_node_name(raw) {
+            Some(n) => Some(n),
+            None => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid node_name: 1-64 chars of [A-Za-z0-9._-]",
+                )
+                .into_response()
+            }
+        },
+    };
+
     // Validate invite
     let invite = match state.db.get_invite(&req.invite_code).await {
         Ok(Some(inv)) => inv,
@@ -383,7 +409,7 @@ async fn register(
     let now = Utc::now();
     let node_record = NodeRecord {
         node_id: node_id.clone(),
-        node_name: req.node_name.clone(),
+        node_name,
         public_key: public_key.to_vec(),
         private_key_encrypted: private_key_opt.map(|k| k.to_vec()).unwrap_or_default(),
         virtual_ip: virtual_ip.clone(),
@@ -698,7 +724,7 @@ async fn resolve_caller(
 
     // Admin token wins immediately.
     if let Some(admin) = admin_token {
-        if provided == *admin {
+        if crate::util::token_eq(&provided, admin) {
             return Ok("admin".to_string());
         }
     }
@@ -732,6 +758,7 @@ struct UpdateMeta {
     binary_size: i64,
     uploaded_by: String,
     uploaded_at: chrono::DateTime<Utc>,
+    signature: Option<String>,
 }
 
 impl From<super::db::UpdateRecord> for UpdateMeta {
@@ -743,6 +770,7 @@ impl From<super::db::UpdateRecord> for UpdateMeta {
             binary_size: r.binary_size,
             uploaded_by: r.uploaded_by,
             uploaded_at: r.uploaded_at,
+            signature: r.signature,
         }
     }
 }
@@ -750,16 +778,43 @@ impl From<super::db::UpdateRecord> for UpdateMeta {
 /// POST /api/v1/update
 /// Upload a new binary update. Body = raw binary bytes.
 /// Required headers:
-///   Authorization: Bearer <admin_token or peer_auth_token>
+///   Authorization: Bearer <admin_token>
 ///   X-Update-Description: <non-empty description>
+///   X-Update-Signature: <base64 ed25519 signature over the hex SHA256>
+///
+/// Admin-only: every auto-updating node installs whatever is published here,
+/// so a peer token must never be enough. Nodes verify the signature against a
+/// pinned public key; the coordinator only stores and relays it.
 async fn publish_update(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let caller = match resolve_caller(&state.admin_token, &state.db, &headers).await {
-        Ok(id) => id,
-        Err(resp) => return resp.into_response(),
+    if let Err(resp) = validate_admin_token(&state.admin_token, &headers) {
+        return resp.into_response();
+    }
+    let caller = "admin".to_string();
+
+    let signature = match headers
+        .get("x-update-signature")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+    {
+        Some(sig)
+            if base64::engine::general_purpose::STANDARD
+                .decode(&sig)
+                .map(|b| b.len() == 64)
+                .unwrap_or(false) =>
+        {
+            sig
+        }
+        _ => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "X-Update-Signature header is required (base64 ed25519 signature)",
+            )
+            .into_response()
+        }
     };
 
     let description = match headers
@@ -785,7 +840,7 @@ async fn publish_update(
     let hash = format!("{:x}", Sha256::digest(&body));
     let size = body.len() as i64;
 
-    let id = match state.db.insert_update(&description, &hash, size, &caller).await {
+    let id = match state.db.insert_update(&description, &hash, size, &caller, &signature).await {
         Ok(id) => id,
         Err(e) => {
             warn!(error = %e, "failed to insert update record");
@@ -935,7 +990,7 @@ async fn sse_stream(
     let is_valid = state
         .admin_token
         .as_ref()
-        .map(|t| *t == token)
+        .map(|t| crate::util::token_eq(&token, t))
         .unwrap_or(false);
 
     if !is_valid {
@@ -1124,4 +1179,23 @@ async fn http_peer_list(
         .collect();
 
     Json(entries).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_name_accepts_simple_names() {
+        assert_eq!(sanitize_node_name(" my-laptop.01_x "), Some("my-laptop.01_x".into()));
+    }
+
+    #[test]
+    fn node_name_rejects_injection_and_junk() {
+        assert_eq!(sanitize_node_name("a\nfile_server"), None);
+        assert_eq!(sanitize_node_name("x {"), None);
+        assert_eq!(sanitize_node_name("<img src=x onerror=alert(1)>"), None);
+        assert_eq!(sanitize_node_name(""), None);
+        assert_eq!(sanitize_node_name(&"a".repeat(65)), None);
+    }
 }

@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
+use base64::Engine;
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -40,7 +42,11 @@ struct UpdateMeta {
     binary_hash: String,
     binary_size: i64,
     uploaded_by: String,
-    uploaded_at: DateTime<Utc>,
+    #[serde(default)]
+    uploaded_at: Option<DateTime<Utc>>,
+    /// Base64 ed25519 signature over `binary_hash`.
+    #[serde(default)]
+    signature: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -106,13 +112,19 @@ impl CoordClient {
         resp.json().await.context("parsing peer list")
     }
 
-    async fn push_update(&self, binary: Vec<u8>, description: &str) -> Result<UpdateMeta> {
+    async fn push_update(
+        &self,
+        binary: Vec<u8>,
+        description: &str,
+        signature_b64: &str,
+    ) -> Result<UpdateMeta> {
         let url = format!("{}/api/v1/update", self.base_url);
         let resp = self
             .client
             .post(&url)
             .bearer_auth(&self.token)
             .header("x-update-description", description)
+            .header("x-update-signature", signature_b64)
             .header("content-type", "application/octet-stream")
             .body(binary)
             .send()
@@ -251,10 +263,54 @@ struct PeerResult {
 // SHA256 of a file
 // ---------------------------------------------------------------------------
 
-fn sha256_file(path: &PathBuf) -> Result<String> {
+fn sha256_file(path: &std::path::Path) -> Result<String> {
     let data = std::fs::read(path)
         .with_context(|| format!("reading {}", path.display()))?;
     Ok(format!("{:x}", Sha256::digest(&data)))
+}
+
+// ---------------------------------------------------------------------------
+// Update signing (ed25519 over the hex SHA256 string)
+// ---------------------------------------------------------------------------
+
+const DEFAULT_PUBKEY_PATH: &str = "/etc/meshlink/update.pub";
+
+fn b64() -> base64::engine::general_purpose::GeneralPurpose {
+    base64::engine::general_purpose::STANDARD
+}
+
+fn read_key_bytes(path: &std::path::Path) -> Result<[u8; 32]> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading key {}", path.display()))?;
+    b64()
+        .decode(text.trim())
+        .with_context(|| format!("decoding base64 key in {}", path.display()))?
+        .try_into()
+        .map_err(|v: Vec<u8>| anyhow::anyhow!("key in {} must be 32 bytes, got {}", path.display(), v.len()))
+}
+
+fn load_signing_key(path: &std::path::Path) -> Result<SigningKey> {
+    Ok(SigningKey::from_bytes(&read_key_bytes(path)?))
+}
+
+fn load_verifying_key(path: &std::path::Path) -> Result<VerifyingKey> {
+    VerifyingKey::from_bytes(&read_key_bytes(path)?).context("invalid ed25519 public key")
+}
+
+fn sign_hash(key: &SigningKey, hash_hex: &str) -> String {
+    b64().encode(key.sign(hash_hex.as_bytes()).to_bytes())
+}
+
+/// Verify `signature_b64` over `hash_hex`. Fails closed on any missing or bad input.
+fn verify_hash(key: &VerifyingKey, hash_hex: &str, signature_b64: Option<&str>) -> Result<()> {
+    let sig_b64 = signature_b64.context("update is unsigned — refusing to apply")?;
+    let sig_bytes: [u8; 64] = b64()
+        .decode(sig_b64)
+        .context("decoding update signature")?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("update signature must be 64 bytes"))?;
+    key.verify(hash_hex.as_bytes(), &Signature::from_bytes(&sig_bytes))
+        .context("update signature does not match the pinned public key")
 }
 
 // ---------------------------------------------------------------------------
@@ -273,7 +329,7 @@ struct Cli {
     #[arg(long, env = "MESHLINK_ADMIN_TOKEN")]
     admin_token: Option<String>,
 
-    /// Peer auth token (used for push-update/check-update/auto-update).
+    /// Peer auth token (used for check-update/auto-update).
     /// Auto-loaded from /etc/meshlink/credentials.json if not provided.
     #[arg(long, env = "MESHLINK_AUTH_TOKEN")]
     auth_token: Option<String>,
@@ -326,12 +382,25 @@ enum Cmd {
         filter: Option<String>,
     },
 
-    /// Upload the current binary to the coord server as a new update.
-    /// Any peer with a valid auth token can then auto-apply it.
+    /// Generate an ed25519 update-signing keypair (<out>.key + <out>.pub).
+    /// Keep the .key with the admin; install the .pub on every node at
+    /// /etc/meshlink/update.pub.
+    Keygen {
+        #[arg(long, default_value = "update")]
+        out: PathBuf,
+    },
+
+    /// Sign and upload the current binary to the coord server as a new update
+    /// (requires the admin token). Nodes only apply updates whose signature
+    /// matches their pinned public key.
     PushUpdate {
         /// Human-readable description of what changed (required).
         #[arg(long, short = 'd')]
         description: String,
+
+        /// Path to the ed25519 signing key created by `mldeploy keygen`.
+        #[arg(long, env = "MLDEPLOY_SIGNING_KEY")]
+        key: PathBuf,
     },
 
     /// Check whether the coord server has an update newer than this binary.
@@ -339,6 +408,10 @@ enum Cmd {
 
     /// Poll the coord server and self-apply updates automatically.
     AutoUpdate {
+        /// Pinned ed25519 public key used to verify updates.
+        #[arg(long, default_value = DEFAULT_PUBKEY_PATH)]
+        pubkey: PathBuf,
+
         /// Seconds between polls.
         #[arg(long, default_value_t = 300)]
         interval: u64,
@@ -410,17 +483,19 @@ async fn main() -> Result<()> {
             let coord = admin_coord(&server, &admin_token)?;
             cmd_self_update(&coord, &ssh, &dest, run.as_deref(), filter.as_deref()).await
         }
-        Cmd::PushUpdate { description } => {
-            let coord = update_coord(&server, &update_token)?;
-            cmd_push_update(&coord, &description).await
+        Cmd::Keygen { out } => cmd_keygen(&out),
+        Cmd::PushUpdate { description, key } => {
+            let coord = admin_coord(&server, &admin_token)?;
+            cmd_push_update(&coord, &description, &key).await
         }
         Cmd::CheckUpdate => {
             let coord = update_coord(&server, &update_token)?;
             cmd_check_update(&coord).await
         }
-        Cmd::AutoUpdate { interval, dest, post_cmd } => {
+        Cmd::AutoUpdate { pubkey, interval, dest, post_cmd } => {
             let coord = update_coord(&server, &update_token)?;
-            cmd_auto_update(&coord, interval, &dest, post_cmd.as_deref()).await
+            let pubkey = load_verifying_key(&pubkey)?;
+            cmd_auto_update(&coord, &pubkey, interval, &dest, post_cmd.as_deref()).await
         }
     }
 }
@@ -657,7 +732,31 @@ async fn cmd_self_update(
 // Update distribution commands
 // ---------------------------------------------------------------------------
 
-async fn cmd_push_update(coord: &CoordClient, description: &str) -> Result<()> {
+fn cmd_keygen(out: &std::path::Path) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let key_path = out.with_extension("key");
+    let pub_path = out.with_extension("pub");
+    let signing = SigningKey::generate(&mut rand::rngs::OsRng);
+
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&key_path)
+        .with_context(|| format!("creating {} (refusing to overwrite)", key_path.display()))?;
+    writeln!(f, "{}", b64().encode(signing.to_bytes()))?;
+    std::fs::write(&pub_path, format!("{}\n", b64().encode(signing.verifying_key().to_bytes())))
+        .with_context(|| format!("writing {}", pub_path.display()))?;
+
+    println!("Signing key: {} (keep secret)", key_path.display());
+    println!("Public key:  {} (install on nodes at {DEFAULT_PUBKEY_PATH})", pub_path.display());
+    Ok(())
+}
+
+async fn cmd_push_update(coord: &CoordClient, description: &str, key_path: &std::path::Path) -> Result<()> {
+    let signing = load_signing_key(key_path)?;
     let self_path = std::fs::read_link("/proc/self/exe").context("resolving /proc/self/exe")?;
     if self_path.to_string_lossy().contains("(deleted)") {
         anyhow::bail!("running binary appears deleted — copy it to a permanent path first");
@@ -666,14 +765,15 @@ async fn cmd_push_update(coord: &CoordClient, description: &str) -> Result<()> {
     let binary = std::fs::read(&self_path)
         .with_context(|| format!("reading {}", self_path.display()))?;
     let hash = format!("{:x}", Sha256::digest(&binary));
+    let signature = sign_hash(&signing, &hash);
 
     info!(
         path = %self_path.display(),
         bytes = binary.len(),
-        "uploading update to coord server"
+        "uploading signed update to coord server"
     );
 
-    let meta = coord.push_update(binary, description).await?;
+    let meta = coord.push_update(binary, description, &signature).await?;
 
     println!("Update published:");
     println!("  ID:          {}", meta.id);
@@ -712,7 +812,9 @@ async fn cmd_check_update(coord: &CoordClient) -> Result<()> {
     println!("  Hash:        {}", meta.binary_hash);
     println!("  Size:        {} bytes", meta.binary_size);
     println!("  Uploaded by: {}", meta.uploaded_by);
-    println!("  Uploaded at: {}", meta.uploaded_at);
+    if let Some(at) = meta.uploaded_at {
+        println!("  Uploaded at: {at}");
+    }
 
     if meta.binary_hash == current_hash {
         println!("\nThis peer is already up to date.");
@@ -725,6 +827,7 @@ async fn cmd_check_update(coord: &CoordClient) -> Result<()> {
 
 async fn cmd_auto_update(
     coord: &CoordClient,
+    pubkey: &VerifyingKey,
     interval_secs: u64,
     dest: &str,
     post_cmd: Option<&str>,
@@ -732,8 +835,13 @@ async fn cmd_auto_update(
     info!(interval = interval_secs, "auto-update daemon started");
 
     loop {
-        match try_apply_update(coord, dest, post_cmd).await {
-            Ok(true) => info!("update applied successfully"),
+        match try_apply_update(coord, pubkey, dest, post_cmd).await {
+            Ok(true) => {
+                info!("update applied successfully");
+                if post_cmd.is_none() {
+                    reexec_if_self(dest)?;
+                }
+            }
             Ok(false) => info!("already up to date"),
             Err(e) => warn!(error = %e, "update check failed"),
         }
@@ -746,11 +854,17 @@ async fn cmd_auto_update(
 /// Returns true if an update was applied, false if already current.
 async fn try_apply_update(
     coord: &CoordClient,
+    pubkey: &VerifyingKey,
     dest: &str,
     post_cmd: Option<&str>,
 ) -> Result<bool> {
-    let self_path = std::fs::read_link("/proc/self/exe").context("resolving /proc/self/exe")?;
-    let current_hash = sha256_file(&self_path)?;
+    // Hash the file on disk, not /proc/self/exe: after a replace the running
+    // image is "(deleted)", and `dest` may not be this binary at all.
+    let current_hash = match sha256_file(std::path::Path::new(dest)) {
+        Ok(h) => h,
+        Err(e) if std::path::Path::new(dest).exists() => return Err(e),
+        Err(_) => String::new(),
+    };
 
     let meta = match coord.latest_update().await? {
         Some(m) => m,
@@ -777,6 +891,7 @@ async fn try_apply_update(
             downloaded_hash
         );
     }
+    verify_hash(pubkey, &downloaded_hash, meta.signature.as_deref())?;
 
     // Write to a temp file next to dest, then atomic rename.
     let tmp = format!("{dest}.new.{}", std::process::id());
@@ -812,6 +927,25 @@ async fn try_apply_update(
     }
 
     Ok(true)
+}
+
+/// If `dest` is the binary we are running, exec it so the new version takes
+/// over the daemon loop (otherwise the old image keeps running until restart).
+fn reexec_if_self(dest: &str) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let self_path = std::fs::read_link("/proc/self/exe").context("resolving /proc/self/exe")?;
+    let self_path = self_path.to_string_lossy();
+    let running = self_path.trim_end_matches(" (deleted)");
+    let dest_canon = std::fs::canonicalize(dest).unwrap_or_else(|_| PathBuf::from(dest));
+    if std::path::Path::new(running) != dest_canon {
+        return Ok(());
+    }
+
+    info!(dest, "re-executing updated binary");
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let err = std::process::Command::new(dest).args(args).exec();
+    Err(anyhow::Error::new(err).context(format!("exec {dest}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -857,4 +991,28 @@ fn require_all_ok(results: &[PeerResult]) -> Result<()> {
         anyhow::bail!("{failures} peer(s) failed");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signed_update_verifies() {
+        let key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let sig = sign_hash(&key, "abc123");
+        assert!(verify_hash(&key.verifying_key(), "abc123", Some(&sig)).is_ok());
+    }
+
+    #[test]
+    fn rejects_unsigned_tampered_or_foreign() {
+        let key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let other = SigningKey::generate(&mut rand::rngs::OsRng);
+        let sig = sign_hash(&key, "abc123");
+        let vk = key.verifying_key();
+        assert!(verify_hash(&vk, "abc123", None).is_err());
+        assert!(verify_hash(&vk, "abc124", Some(&sig)).is_err());
+        assert!(verify_hash(&other.verifying_key(), "abc123", Some(&sig)).is_err());
+        assert!(verify_hash(&vk, "abc123", Some("not-base64!")).is_err());
+    }
 }

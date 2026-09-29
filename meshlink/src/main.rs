@@ -11,6 +11,7 @@ mod router;
 mod setup;
 mod state;
 mod tun;
+mod util;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -611,6 +612,7 @@ async fn run_daemon(
         udp_socket.clone(),
         channels.udp_to_router_tx,
         coord_tx,
+        coord_addr,
     ));
 
     let udp_writer = tokio::spawn(net::udp::udp_writer_task(

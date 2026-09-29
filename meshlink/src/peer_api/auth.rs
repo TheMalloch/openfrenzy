@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
-use subtle::ConstantTimeEq;
 
 const MAX_FAILURES: u32 = 5;
 const LOCKOUT: Duration = Duration::from_secs(60);
@@ -57,16 +56,7 @@ impl RateLimiter {
     }
 }
 
-/// Constant-time token comparison — avoids timing side channels.
-pub fn token_eq(provided: &str, expected: &str) -> bool {
-    let a = provided.as_bytes();
-    let b = expected.as_bytes();
-    if a.len() != b.len() {
-        let _ = b.ct_eq(b); // keep timing uniform
-        return false;
-    }
-    a.ct_eq(b).unwrap_u8() == 1
-}
+pub use crate::util::token_eq;
 
 pub fn audit(ip: IpAddr, method: &str, path: &str, ok: bool, note: &str) {
     if ok {

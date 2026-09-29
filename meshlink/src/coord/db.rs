@@ -46,6 +46,8 @@ pub struct UpdateRecord {
     pub binary_size: i64,
     pub uploaded_by: String,
     pub uploaded_at: DateTime<Utc>,
+    /// Base64 ed25519 signature over `binary_hash` (hex string bytes).
+    pub signature: Option<String>,
 }
 
 /// Database handle wrapping a PostgreSQL connection pool.
@@ -142,6 +144,11 @@ impl Db {
         .execute(&self.pool)
         .await
         .context("creating updates table")?;
+
+        sqlx::query("ALTER TABLE updates ADD COLUMN IF NOT EXISTS signature TEXT")
+            .execute(&self.pool)
+            .await
+            .context("migrating updates: signature")?;
 
         info!("database tables created");
         Ok(())
@@ -443,15 +450,17 @@ impl Db {
         binary_hash: &str,
         binary_size: i64,
         uploaded_by: &str,
+        signature: &str,
     ) -> Result<i64> {
         let row: (i64,) = sqlx::query_as(
-            r#"INSERT INTO updates (description, binary_hash, binary_size, uploaded_by)
-               VALUES ($1, $2, $3, $4) RETURNING id"#,
+            r#"INSERT INTO updates (description, binary_hash, binary_size, uploaded_by, signature)
+               VALUES ($1, $2, $3, $4, $5) RETURNING id"#,
         )
         .bind(description)
         .bind(binary_hash)
         .bind(binary_size)
         .bind(uploaded_by)
+        .bind(signature)
         .fetch_one(&self.pool)
         .await
         .context("inserting update record")?;
