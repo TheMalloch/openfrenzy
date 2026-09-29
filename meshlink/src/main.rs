@@ -11,13 +11,14 @@ mod router;
 mod setup;
 mod state;
 mod tun;
+mod util;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{Cli, Command};
 use std::path::Path;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -51,6 +52,7 @@ fn main() -> Result<()> {
         server,
         invite: Some(invite_code),
         name,
+        public_key: byok_public_key,
         ..
     }) = &cli.command
     {
@@ -68,7 +70,9 @@ fn main() -> Result<()> {
 
             println!("Registering with server {server_url}...");
             let client = api_client::ApiClient::new(server_url);
-            let resp = client.register(invite_code, name.as_deref()).await?;
+            let resp = client
+                .register(invite_code, name.as_deref(), byok_public_key.as_deref())
+                .await?;
 
             // Save credentials
             let creds = credentials::Credentials {
@@ -83,8 +87,13 @@ fn main() -> Result<()> {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| wrap_permission_error(e, "creating config directory"))?;
             }
-            std::fs::write(&cli.config, &resp.config_toml)
-                .map_err(|e| wrap_permission_error(e, "writing config file"))?;
+            // Holds the private key and auth token: group-readable, never world.
+            util::write_private(&cli.config, resp.config_toml.as_bytes()).map_err(|e| {
+                match e.downcast::<std::io::Error>() {
+                    Ok(io) => wrap_permission_error(io, "writing config file"),
+                    Err(other) => other.context("writing config file"),
+                }
+            })?;
 
             println!("Registration successful!");
             println!("  Node ID:      {}", resp.node_id);
@@ -434,6 +443,18 @@ async fn handle_cs_action(config_path: &std::path::Path, action: &cli::CsAction)
             coord::caddy::write_and_reload(&config.caddy_config_path, &config.caddy_admin_api, &content).await?;
             println!("Caddy config written to {} and reloaded.", config.caddy_config_path);
         }
+        cli::CsAction::Restart => {
+            let status = tokio::process::Command::new("systemctl")
+                .args(["restart", "meshlink-coord"])
+                .status()
+                .await
+                .context("running systemctl restart meshlink-coord")?;
+            if status.success() {
+                println!("meshlink-coord restarted.");
+            } else {
+                anyhow::bail!("systemctl restart meshlink-coord failed (exit code {:?})", status.code());
+            }
+        }
     }
 
     Ok(())
@@ -447,6 +468,22 @@ async fn run_daemon(
     info!("MeshLink starting");
 
     let mut config = config::Config::load(config_path)?;
+
+    // Older versions wrote these secret files world-readable; tighten them.
+    let secret_files = [
+        config_path.to_path_buf(),
+        config_path
+            .parent()
+            .unwrap_or(std::path::Path::new("/etc/meshlink"))
+            .join("credentials.json"),
+    ];
+    for path in &secret_files {
+        match util::restrict_other_access(path) {
+            Ok(true) => info!(path = %path.display(), "removed world access from secret file"),
+            Ok(false) => {}
+            Err(e) => warn!(path = %path.display(), error = %e, "could not restrict permissions on secret file"),
+        }
+    }
 
     // Override coordination server if provided via CLI
     if let Some(addr) = coord_server_override {
@@ -495,14 +532,13 @@ async fn run_daemon(
             .map(|net| net.addr())
             .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
 
-        let peer_info = state::PeerInfo {
-            public_key: pub_key_bytes,
-            endpoint: peer_config.endpoint,
+        let mut peer_info = state::PeerInfo::new(
+            pub_key_bytes,
+            peer_config.endpoint,
             virtual_ip,
-            allowed_ips: peer_config.allowed_ips.clone(),
-            tx_bytes: 0,
-            rx_bytes: 0,
-        };
+            peer_config.allowed_ips.clone(),
+        );
+        peer_info.static_peer = peer_config.static_peer;
         shared_state.add_peer(peer_info).await;
     }
 
@@ -522,36 +558,65 @@ async fn run_daemon(
 
     // Parse coordination server address — prefer IPv4 so the coord server sees our
     // IPv4 source address (peers without IPv6 can't reach an IPv6-only endpoint).
-    let coord_addr: std::net::SocketAddr = {
-        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&config.coordination.server)
-            .await
-            .context("resolving coordination server")?
-            .collect();
-        addrs
-            .iter()
-            .find(|a| a.is_ipv4())
-            .or(addrs.first())
-            .copied()
-            .context("no addresses for coordination server")?
+    //
+    // The `server` field may be written as a bare "host:port" (canonical) or as
+    // "https://host" / "http://host" (common misconfiguration when the same domain
+    // is used for HTTPS registration).  Strip any scheme and supply the default UDP
+    // port (4000) when none is present.
+    let coord_server_raw = config.coordination.server.trim();
+    let coord_server_host = coord_server_raw
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    let coord_server_str = if coord_server_host.contains(':') {
+        coord_server_host.to_string()
+    } else {
+        format!("{coord_server_host}:4000")
     };
+
+    // If api_url wasn't set but the server field was an HTTPS URL, derive it now
+    // so the HTTP fallback activates automatically.
+    if config.coordination.api_url.is_none()
+        && coord_server_raw.starts_with("https://")
+    {
+        let host = coord_server_host.split('/').next().unwrap_or(coord_server_host);
+        config.coordination.api_url = Some(format!("https://{host}"));
+    }
+
+    // Resolved in the background (see the discovery spawn below) so a DNS
+    // failure at boot does not stop the data plane. Until it is set, the UDP
+    // reader drops all coordination packets.
+    let coord_addr: Arc<std::sync::OnceLock<std::net::SocketAddr>> =
+        Arc::new(std::sync::OnceLock::new());
+
+    // Coordinator auth token, shared by the HTTP fallback and the peer API so a
+    // rotation through the peer API takes effect everywhere. credentials.json
+    // is what rotation updates, so it wins over the token in config.toml.
+    let creds_path = config_path
+        .parent()
+        .unwrap_or(std::path::Path::new("/etc/meshlink"))
+        .join("credentials.json");
+    let coord_token: Option<Arc<tokio::sync::RwLock<String>>> =
+        credentials::Credentials::load_from(&creds_path)
+            .ok()
+            .map(|c| c.auth_token)
+            .or_else(|| config.coordination.auth_token.clone())
+            .map(|t| Arc::new(tokio::sync::RwLock::new(t)));
 
     // Spawn peer API (optional, bound to the mesh virtual IP)
     if config.peer_api.enabled {
         let peer_api_config = config.peer_api.clone();
         let peer_api_state = shared_state.clone();
         let peer_api_vip = config.node.virtual_ip.addr();
-        let peer_api_creds = config_path
-            .parent()
-            .unwrap_or(std::path::Path::new("/etc/meshlink"))
-            .join("credentials.json");
-        let peer_api_coord = config.coordination.server.clone();
+        let peer_api_creds = creds_path.clone();
+        let peer_api_token = coord_token.clone();
         tokio::spawn(async move {
             if let Err(e) = peer_api::run(
                 peer_api_config,
                 peer_api_state,
                 peer_api_vip,
                 peer_api_creds,
-                peer_api_coord,
+                peer_api_token,
             )
             .await
             {
@@ -571,6 +636,7 @@ async fn run_daemon(
         udp_socket.clone(),
         channels.udp_to_router_tx,
         coord_tx,
+        coord_addr.clone(),
     ));
 
     let udp_writer = tokio::spawn(net::udp::udp_writer_task(
@@ -590,16 +656,34 @@ async fn run_daemon(
         channels.router_to_tun_tx,
     ));
 
-    let discovery = tokio::spawn(discovery::discovery_task(
-        shared_state.clone(),
-        identity.clone(),
-        udp_socket.clone(),
-        coord_addr,
-        actual_port,
-        config_path.to_path_buf(),
-        config.node.virtual_ip.addr(),
-        coord_rx,
-    ));
+    let http_fallback = discovery::build_http_fallback(
+        config.coordination.api_url.clone(),
+        coord_token.clone(),
+    );
+
+    let discovery = {
+        let state = shared_state.clone();
+        let identity = identity.clone();
+        let socket = udp_socket.clone();
+        let config_path = config_path.to_path_buf();
+        let virtual_ip = config.node.virtual_ip.addr();
+        tokio::spawn(async move {
+            let addr = resolve_coord_with_retry(&coord_server_str).await;
+            let _ = coord_addr.set(net::udp::normalize_addr(addr));
+            discovery::discovery_task(
+                state,
+                identity,
+                socket,
+                addr,
+                actual_port,
+                config_path,
+                virtual_ip,
+                coord_rx,
+                http_fallback,
+            )
+            .await
+        })
+    };
 
     let cli_listener = tokio::spawn(cli::cli_listener_task(shared_state.clone()));
 
@@ -644,6 +728,28 @@ async fn run_daemon(
 
     info!("MeshLink stopped");
     Ok(())
+}
+
+/// Resolve the coordination server, retrying with backoff until it works.
+/// Prefers IPv4 so the coord server sees our IPv4 source address (peers
+/// without IPv6 can't reach an IPv6-only endpoint).
+async fn resolve_coord_with_retry(server: &str) -> std::net::SocketAddr {
+    let mut backoff = std::time::Duration::from_secs(1);
+    loop {
+        match tokio::net::lookup_host(server).await {
+            Ok(addrs) => {
+                let addrs: Vec<std::net::SocketAddr> = addrs.collect();
+                if let Some(addr) = addrs.iter().find(|a| a.is_ipv4()).or(addrs.first()) {
+                    info!(%server, %addr, "resolved coordination server");
+                    return *addr;
+                }
+                warn!(%server, "coordination server has no addresses, will retry");
+            }
+            Err(e) => warn!(%server, error = %e, ?backoff, "resolving coordination server failed, will retry"),
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(std::time::Duration::from_secs(60));
+    }
 }
 
 /// If an IO error is a permission error, wrap it with a suggestion to run `meshlink setup`.

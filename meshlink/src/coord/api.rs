@@ -9,7 +9,7 @@ use super::scanner::{ScanState, SseTx};
 use super::udp_handler::{self, PeerMap};
 use super::update_store::UpdateStore;
 use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse};
@@ -20,7 +20,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio_stream::wrappers::BroadcastStream;
@@ -35,6 +35,7 @@ pub struct AppState {
     pub ip_allocator: IpAllocator,
     pub port_allocator: PortAllocator,
     pub coord_server_addr: String,
+    pub coord_api_url: Option<String>,
     pub admin_token: Option<String>,
     pub default_listen_port: u16,
     pub default_expiry_hours: i64,
@@ -62,8 +63,10 @@ fn router(state: AppState) -> Router {
         // Admin invite endpoints
         .route("/api/v1/admin/invites", get(list_invites))
         .route("/api/v1/admin/invites/{code}", delete(revoke_invite))
-        // Peer token rotation (authenticated with current peer token)
+        // Peer node endpoints (authenticated with peer token)
         .route("/api/v1/node/token", patch(rotate_peer_token))
+        .route("/api/v1/node/keepalive", post(http_keepalive))
+        .route("/api/v1/node/peers", get(http_peer_list))
         // Update distribution (admin or peer token)
         .route("/api/v1/update", post(publish_update))
         .route("/api/v1/update/latest", get(get_latest_update))
@@ -87,6 +90,7 @@ pub async fn run_http_server(
     ip_allocator: IpAllocator,
     port_allocator: PortAllocator,
     coord_server_addr: String,
+    coord_api_url: Option<String>,
     admin_token: Option<String>,
     default_listen_port: u16,
     default_expiry_hours: i64,
@@ -105,6 +109,7 @@ pub async fn run_http_server(
         ip_allocator,
         port_allocator,
         coord_server_addr,
+        coord_api_url,
         admin_token,
         default_listen_port,
         default_expiry_hours,
@@ -126,7 +131,12 @@ pub async fn run_http_server(
         .expect("bind HTTP listener");
     info!(%addr, "HTTP API server starting");
 
-    if let Err(e) = axum::serve(listener, app).await {
+    if let Err(e) = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    {
         warn!(error = %e, "HTTP server error");
     }
 }
@@ -137,12 +147,17 @@ pub async fn run_http_server(
 struct RegisterRequest {
     invite_code: String,
     node_name: Option<String>,
+    /// Base64-encoded X25519 public key. When supplied, the coordinator skips key
+    /// generation and never stores or returns a private key (BYOK mode).
+    public_key: Option<String>,
 }
 
 #[derive(Serialize)]
 struct RegisterResponse {
     node_id: String,
-    private_key: String,
+    /// Absent when the peer supplied its own public key (BYOK mode).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    private_key: Option<String>,
     public_key: String,
     virtual_ip: String,
     config_toml: String,
@@ -238,7 +253,7 @@ fn validate_admin_token(
         )
     })?;
 
-    if provided != *configured {
+    if !crate::util::token_eq(&provided, configured) {
         return Err((
             StatusCode::UNAUTHORIZED,
             Json(ErrorResponse {
@@ -251,6 +266,18 @@ fn validate_admin_token(
 }
 
 // --- Helpers ---
+
+/// Validate a user-supplied node name. It ends up in the Caddyfile and the
+/// admin UI, so only a conservative charset is allowed.
+fn sanitize_node_name(raw: &str) -> Option<String> {
+    let name = raw.trim();
+    let ok = !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    ok.then(|| name.to_string())
+}
 
 /// Regenerate Caddy config from DB and reload.
 async fn regen_caddy(state: &AppState) {
@@ -273,6 +300,20 @@ async fn register(
     State(state): State<AppState>,
     Json(req): Json<RegisterRequest>,
 ) -> impl IntoResponse {
+    let node_name = match req.node_name.as_deref() {
+        None => None,
+        Some(raw) => match sanitize_node_name(raw) {
+            Some(n) => Some(n),
+            None => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid node_name: 1-64 chars of [A-Za-z0-9._-]",
+                )
+                .into_response()
+            }
+        },
+    };
+
     // Validate invite
     let invite = match state.db.get_invite(&req.invite_code).await {
         Ok(Some(inv)) => inv,
@@ -295,8 +336,33 @@ async fn register(
         return error_response(StatusCode::BAD_REQUEST, "invite code expired").into_response();
     }
 
-    // Generate keypair
-    let (private_key, public_key) = key_manager::generate_node_keypair();
+    // Resolve keypair: BYOK (peer supplies public key) or coordinator-generated.
+    let (private_key_opt, public_key): (Option<[u8; 32]>, [u8; 32]) =
+        if let Some(ref pk_b64) = req.public_key {
+            let decoded = match base64::engine::general_purpose::STANDARD.decode(pk_b64) {
+                Ok(b) => b,
+                Err(_) => {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        "invalid public_key: not valid base64",
+                    )
+                    .into_response()
+                }
+            };
+            if decoded.len() != 32 {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid public_key: must be 32 bytes",
+                )
+                .into_response();
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&decoded);
+            (None, arr)
+        } else {
+            let (priv_key, pub_key) = key_manager::generate_node_keypair();
+            (Some(priv_key), pub_key)
+        };
 
     // Allocate IP
     let allocated = match state.db.allocated_ips().await {
@@ -342,9 +408,9 @@ async fn register(
     let now = Utc::now();
     let node_record = NodeRecord {
         node_id: node_id.clone(),
-        node_name: req.node_name.clone(),
+        node_name,
         public_key: public_key.to_vec(),
-        private_key_encrypted: private_key.to_vec(),
+        private_key_encrypted: private_key_opt.map(|k| k.to_vec()).unwrap_or_default(),
         virtual_ip: virtual_ip.clone(),
         auth_token: auth_token.clone(),
         status: "registered".to_string(),
@@ -359,15 +425,19 @@ async fn register(
         port_range_size: Some(port_size as i32),
     };
 
-    // Insert node
-    if let Err(e) = state.db.insert_node(&node_record).await {
-        warn!(error = ?e, "failed to insert node");
-        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
-    }
-
-    // Increment invite use count
-    if let Err(e) = state.db.increment_invite_use(&req.invite_code, &node_id).await {
-        warn!(error = %e, "failed to increment invite use count");
+    // Insert node and consume the invite in one transaction. The checks above
+    // give friendly errors; this one is authoritative under concurrency.
+    match state.db.register_node_with_invite(&req.invite_code, &node_record).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return error_response(StatusCode::BAD_REQUEST, "invite code fully used or expired")
+                .into_response()
+        }
+        Err(e) => {
+            warn!(error = ?e, "failed to insert node");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+                .into_response();
+        }
     }
 
     // Generate config
@@ -376,9 +446,19 @@ async fn register(
         &node_record,
         &active_nodes,
         &state.coord_server_addr,
+        state.coord_api_url.as_deref(),
     );
 
-    let private_key_b64 = base64::engine::general_purpose::STANDARD.encode(private_key);
+    let private_key_b64 = node_record
+        .private_key_encrypted
+        .is_empty()
+        .then(|| None)
+        .unwrap_or_else(|| {
+            Some(
+                base64::engine::general_purpose::STANDARD
+                    .encode(&node_record.private_key_encrypted),
+            )
+        });
     let public_key_b64 = base64::engine::general_purpose::STANDARD.encode(public_key);
 
     info!(
@@ -505,6 +585,13 @@ async fn disable_peer(
     match state.db.set_node_status(&id, "deregistered").await {
         Ok(()) => {
             info!(node_id = %id, "peer disabled");
+            // Drop it from the live registry so it stops receiving pushed
+            // peer lists; UDP messages from a disabled key are ignored.
+            if let Ok(Some(node)) = state.db.get_node(&id).await {
+                if let Ok(key) = <[u8; 32]>::try_from(node.public_key.as_slice()) {
+                    state.peer_map.lock().await.remove(&key);
+                }
+            }
             regen_caddy(&state).await;
             udp_handler::broadcast_peer_list(&state.udp_socket, &state.peer_map, &state.db).await;
             StatusCode::OK.into_response()
@@ -647,7 +734,7 @@ async fn resolve_caller(
 
     // Admin token wins immediately.
     if let Some(admin) = admin_token {
-        if provided == *admin {
+        if crate::util::token_eq(&provided, admin) {
             return Ok("admin".to_string());
         }
     }
@@ -681,6 +768,7 @@ struct UpdateMeta {
     binary_size: i64,
     uploaded_by: String,
     uploaded_at: chrono::DateTime<Utc>,
+    signature: Option<String>,
 }
 
 impl From<super::db::UpdateRecord> for UpdateMeta {
@@ -692,6 +780,7 @@ impl From<super::db::UpdateRecord> for UpdateMeta {
             binary_size: r.binary_size,
             uploaded_by: r.uploaded_by,
             uploaded_at: r.uploaded_at,
+            signature: r.signature,
         }
     }
 }
@@ -699,16 +788,43 @@ impl From<super::db::UpdateRecord> for UpdateMeta {
 /// POST /api/v1/update
 /// Upload a new binary update. Body = raw binary bytes.
 /// Required headers:
-///   Authorization: Bearer <admin_token or peer_auth_token>
+///   Authorization: Bearer <admin_token>
 ///   X-Update-Description: <non-empty description>
+///   X-Update-Signature: <base64 ed25519 signature over the hex SHA256>
+///
+/// Admin-only: every auto-updating node installs whatever is published here,
+/// so a peer token must never be enough. Nodes verify the signature against a
+/// pinned public key; the coordinator only stores and relays it.
 async fn publish_update(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let caller = match resolve_caller(&state.admin_token, &state.db, &headers).await {
-        Ok(id) => id,
-        Err(resp) => return resp.into_response(),
+    if let Err(resp) = validate_admin_token(&state.admin_token, &headers) {
+        return resp.into_response();
+    }
+    let caller = "admin".to_string();
+
+    let signature = match headers
+        .get("x-update-signature")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+    {
+        Some(sig)
+            if base64::engine::general_purpose::STANDARD
+                .decode(&sig)
+                .map(|b| b.len() == 64)
+                .unwrap_or(false) =>
+        {
+            sig
+        }
+        _ => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "X-Update-Signature header is required (base64 ed25519 signature)",
+            )
+            .into_response()
+        }
     };
 
     let description = match headers
@@ -734,7 +850,7 @@ async fn publish_update(
     let hash = format!("{:x}", Sha256::digest(&body));
     let size = body.len() as i64;
 
-    let id = match state.db.insert_update(&description, &hash, size, &caller).await {
+    let id = match state.db.insert_update(&description, &hash, size, &caller, &signature).await {
         Ok(id) => id,
         Err(e) => {
             warn!(error = %e, "failed to insert update record");
@@ -884,7 +1000,7 @@ async fn sse_stream(
     let is_valid = state
         .admin_token
         .as_ref()
-        .map(|t| *t == token)
+        .map(|t| crate::util::token_eq(&token, t))
         .unwrap_or(false);
 
     if !is_valid {
@@ -922,3 +1038,192 @@ async fn sse_stream(
         .into_response()
 }
 
+// ---------------------------------------------------------------------------
+// HTTP fallback: keepalive + peer list for nodes that can't reach UDP
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct HttpKeepaliveRequest {
+    listen_port: u16,
+    #[serde(default)]
+    lan_ips: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct HttpPeerEntry {
+    public_key: String,
+    virtual_ip: String,
+    endpoint: Option<String>,
+    lan_endpoint: Option<String>,
+}
+
+/// Extract the real client IP. X-Real-IP / X-Forwarded-For are only trusted
+/// when the connection comes from a local reverse proxy (Caddy on the same
+/// host); from anyone else they are client-controlled and ignored.
+fn real_ip(headers: &HeaderMap, conn: SocketAddr) -> IpAddr {
+    let from_local_proxy = match conn.ip() {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
+    };
+    if !from_local_proxy {
+        return conn.ip();
+    }
+    if let Some(v) = headers
+        .get("x-real-ip")
+        .or_else(|| headers.get("x-forwarded-for"))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .and_then(|s| s.trim().parse::<IpAddr>().ok())
+    {
+        return v;
+    }
+    conn.ip()
+}
+
+/// POST /api/v1/node/keepalive
+/// Lets a node send a heartbeat via HTTPS when UDP is unreachable.
+async fn http_keepalive(
+    State(state): State<AppState>,
+    ConnectInfo(conn): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(req): Json<HttpKeepaliveRequest>,
+) -> impl IntoResponse {
+    let token = match extract_token(&headers) {
+        Some(t) => t,
+        None => return error_response(StatusCode::UNAUTHORIZED, "missing Authorization").into_response(),
+    };
+
+    let node_id = match state.db.validate_peer_token(&token).await {
+        Ok(Some(id)) => id,
+        Ok(None) => return error_response(StatusCode::UNAUTHORIZED, "invalid token").into_response(),
+        Err(e) => {
+            warn!(error = %e, "db error in http_keepalive");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    };
+
+    let node = match state.db.get_node(&node_id).await {
+        Ok(Some(n)) => n,
+        Ok(None) => return error_response(StatusCode::UNAUTHORIZED, "invalid token").into_response(),
+        Err(e) => {
+            warn!(error = %e, "db error fetching node in http_keepalive");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    };
+
+    let ip = real_ip(&headers, conn);
+    let endpoint = SocketAddr::new(ip, req.listen_port);
+    let lan_ip = req.lan_ips.first()
+        .and_then(|s| s.parse::<std::net::Ipv4Addr>().ok());
+
+    // Update in-memory peer map
+    if node.public_key.len() == 32 {
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&node.public_key);
+        let mut map = state.peer_map.lock().await;
+        let entry = map
+            .entry(key)
+            .or_insert_with(|| udp_handler::RegisteredPeer::new(key, endpoint, req.listen_port));
+        entry.seen_from(endpoint);
+        entry.listen_port = req.listen_port;
+        entry.virtual_ip = node.virtual_ip.split('/').next().and_then(|s| s.parse().ok());
+        entry.lan_ip = lan_ip;
+    }
+
+    // Update DB heartbeat + endpoint
+    if let Err(e) = state.db.update_heartbeat(&node_id, Some(&endpoint.to_string())).await {
+        warn!(error = %e, "failed to update heartbeat in http_keepalive");
+    }
+
+    StatusCode::OK.into_response()
+}
+
+/// GET /api/v1/node/peers
+/// Returns the active peer list as JSON; used by nodes falling back from UDP.
+async fn http_peer_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let token = match extract_token(&headers) {
+        Some(t) => t,
+        None => return error_response(StatusCode::UNAUTHORIZED, "missing Authorization").into_response(),
+    };
+
+    let node_id = match state.db.validate_peer_token(&token).await {
+        Ok(Some(id)) => id,
+        Ok(None) => return error_response(StatusCode::UNAUTHORIZED, "invalid token").into_response(),
+        Err(e) => {
+            warn!(error = %e, "db error in http_peer_list");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    };
+
+    let peers = match state.db.list_active_nodes().await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(error = %e, "failed to list peers for http_peer_list");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    };
+
+    let map = state.peer_map.lock().await;
+    let entries: Vec<HttpPeerEntry> = peers
+        .into_iter()
+        .filter(|p| p.node_id != node_id)
+        .map(|p| {
+            let pub_key_b64 = base64::engine::general_purpose::STANDARD.encode(&p.public_key);
+            let virtual_ip = p.virtual_ip.split('/').next().unwrap_or(&p.virtual_ip).to_string();
+
+            // Prefer live endpoint from peer_map (most recent), fall back to DB
+            let (endpoint, lan_endpoint) = if p.public_key.len() == 32 {
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&p.public_key);
+                let ep = map.get(&key)
+                    .and_then(|r| r.v4_endpoint)
+                    .map(|e| e.to_string())
+                    .or(p.endpoint.clone())
+                    .or_else(|| map.get(&key).map(|r| r.endpoint.to_string()));
+                let lan_ep = map.get(&key)
+                    .and_then(|r| r.lan_ip.map(|ip| format!("{}:{}", ip, p.listen_port)));
+                (ep, lan_ep)
+            } else {
+                (p.endpoint.clone(), p.lan_endpoint.clone())
+            };
+
+            HttpPeerEntry { public_key: pub_key_b64, virtual_ip, endpoint, lan_endpoint }
+        })
+        .collect();
+
+    Json(entries).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_name_accepts_simple_names() {
+        assert_eq!(sanitize_node_name(" my-laptop.01_x "), Some("my-laptop.01_x".into()));
+    }
+
+    #[test]
+    fn node_name_rejects_injection_and_junk() {
+        assert_eq!(sanitize_node_name("a\nfile_server"), None);
+        assert_eq!(sanitize_node_name("x {"), None);
+        assert_eq!(sanitize_node_name("<img src=x onerror=alert(1)>"), None);
+        assert_eq!(sanitize_node_name(""), None);
+        assert_eq!(sanitize_node_name(&"a".repeat(65)), None);
+    }
+
+    #[test]
+    fn forwarded_headers_only_trusted_from_loopback() {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "9.9.9.9, 10.0.0.1".parse().unwrap());
+        let direct: SocketAddr = "203.0.113.5:1234".parse().unwrap();
+        let proxy: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let mapped: SocketAddr = "[::ffff:127.0.0.1]:1234".parse().unwrap();
+        assert_eq!(real_ip(&h, direct), direct.ip());
+        assert_eq!(real_ip(&h, proxy), "9.9.9.9".parse::<IpAddr>().unwrap());
+        assert_eq!(real_ip(&h, mapped), "9.9.9.9".parse::<IpAddr>().unwrap());
+    }
+}

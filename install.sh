@@ -1,22 +1,11 @@
 #!/usr/bin/env bash
 #
-# install.sh — Install meshlink binary with permissions so it runs without sudo.
+# install.sh — Install meshlink (peer node or coordination server).
 #
-# What it does:
-#   1. Builds the release binary (if needed)
-#   2. Copies binary to /usr/local/bin/meshlink
-#   3. Sets Linux capabilities (TUN creation, low-port binding)
-#   4. Creates meshlink system group
-#   5. Creates /etc/meshlink (config dir), /var/run, /var/log paths with group perms
-#   6. Adds calling user to meshlink group
-#
-# After running this, the user can do:
-#   meshlink cs db-setup
-#   meshlink cs create-invite
-#   meshlink cs start
-#   meshlink up --server ... --invite ...
-#
-# All without sudo.
+# Builds the binary, sets capabilities, creates system user/group/dirs,
+# installs the systemd service, and enables it.  Does NOT start the service
+# or prompt for configuration values — follow the printed next-steps after
+# the script completes.
 #
 # Usage:
 #   sudo ./install.sh
@@ -28,139 +17,279 @@ SRC_BINARY="$SCRIPT_DIR/target/release/meshlink"
 INSTALL_PATH="/usr/local/bin/meshlink"
 GROUP_NAME="meshlink"
 CONFIG_DIR="/etc/meshlink"
-PID_DIR="/var/run"
+STATE_DIR="/var/lib/meshlink"
+RUNTIME_DIR="/run/meshlink"
 LOG_FILE="/var/log/meshlink.log"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-CYAN='\033[0;36m'
-NC='\033[0m'
-
+RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; YELLOW='\033[1;33m'; NC='\033[0m'
 log()  { echo -e "${CYAN}[install]${NC} $*"; }
-ok()   { echo -e "${GREEN}  [done]${NC} $*"; }
-fail() { echo -e "${RED}  [fail]${NC} $*"; exit 1; }
+ok()   { echo -e "${GREEN}  ok${NC}  $*"; }
+warn() { echo -e "${YELLOW}  warn${NC} $*"; }
+fail() { echo -e "${RED}  fail${NC} $*"; exit 1; }
 
-# ── Must be root ────────────────────────────────────────────────────
-if [[ $EUID -ne 0 ]]; then
-    echo "This script must be run as root."
-    echo "  sudo $0"
-    exit 1
-fi
+# ── Root check ────────────────────────────────────────────────────────────────
+[[ $EUID -ne 0 ]] && fail "must be run as root:  sudo $0"
 
 REAL_USER="${SUDO_USER:-}"
-if [[ -z "$REAL_USER" ]]; then
-    echo "Warning: \$SUDO_USER not set, cannot add user to group automatically."
-fi
 
-# ── 1. Build ────────────────────────────────────────────────────────
+# ── Mode selection ────────────────────────────────────────────────────────────
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  MeshLink installer"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+echo "  1) peer  — node that joins the mesh"
+echo "  2) coord — coordination server"
+echo ""
+MODE_INPUT="${1:-${INSTALL_MODE:-}}"
+if [[ -z "$MODE_INPUT" ]]; then
+    read -rp "  Install as [peer/coord]: " MODE_INPUT
+fi
+echo ""
+
+case "${MODE_INPUT,,}" in
+    1|p|peer)   MODE=peer  ;;
+    2|c|coord)  MODE=coord ;;
+    *) fail "invalid choice: '$MODE_INPUT' — enter peer or coord" ;;
+esac
+
+log "installing meshlink as: $MODE"
+
+# ── 1. Build binary ───────────────────────────────────────────────────────────
 if [[ ! -f "$SRC_BINARY" ]]; then
     log "building meshlink (release)..."
     if [[ -n "$REAL_USER" ]]; then
-        sudo -u "$REAL_USER" cargo build --manifest-path "$SCRIPT_DIR/meshlink/Cargo.toml" --release 2>&1 | tail -3
+        sudo -u "$REAL_USER" cargo build \
+            --manifest-path "$SCRIPT_DIR/meshlink/Cargo.toml" \
+            --release 2>&1 | tail -5
     else
-        cargo build --manifest-path "$SCRIPT_DIR/meshlink/Cargo.toml" --release 2>&1 | tail -3
+        cargo build \
+            --manifest-path "$SCRIPT_DIR/meshlink/Cargo.toml" \
+            --release 2>&1 | tail -5
     fi
 fi
+[[ -f "$SRC_BINARY" ]] || fail "binary not found at $SRC_BINARY — build failed"
 
-if [[ ! -f "$SRC_BINARY" ]]; then
-    fail "binary not found at $SRC_BINARY"
-fi
-
-# ── 2. Install binary ──────────────────────────────────────────────
-log "installing binary to $INSTALL_PATH"
+# ── 2. Install binary ─────────────────────────────────────────────────────────
+log "installing binary..."
 cp "$SRC_BINARY" "$INSTALL_PATH"
 chmod 755 "$INSTALL_PATH"
-ok "copied to $INSTALL_PATH"
+ok "$INSTALL_PATH"
 
-# ── 3. Set capabilities ────────────────────────────────────────────
-# CAP_NET_ADMIN  — create/configure TUN devices
-# CAP_NET_RAW    — raw socket access (for TUN)
-# CAP_NET_BIND_SERVICE — bind to ports < 1024 (if needed)
-log "setting Linux capabilities"
-
-if ! command -v setcap &>/dev/null; then
-    fail "setcap not found — install libcap2-bin (apt install libcap2-bin)"
-fi
-
+# ── 3. Set capabilities ───────────────────────────────────────────────────────
+log "setting capabilities..."
+command -v setcap &>/dev/null || fail "setcap not found — apt install libcap2-bin"
 setcap 'cap_net_admin,cap_net_raw,cap_net_bind_service=eip' "$INSTALL_PATH"
-ok "cap_net_admin,cap_net_raw,cap_net_bind_service on $INSTALL_PATH"
+getcap "$INSTALL_PATH" | grep -q cap_net_admin || fail "capability verification failed"
+ok "cap_net_admin cap_net_raw cap_net_bind_service"
 
-# Verify
-if getcap "$INSTALL_PATH" | grep -q cap_net_admin; then
-    ok "capabilities verified"
-else
-    fail "capability verification failed"
-fi
-
-# ── 4. Create system group ─────────────────────────────────────────
-log "setting up group '$GROUP_NAME'"
-if getent group "$GROUP_NAME" &>/dev/null; then
-    ok "group '$GROUP_NAME' already exists"
-else
+# ── 4. System group ───────────────────────────────────────────────────────────
+log "ensuring system group '$GROUP_NAME'..."
+if ! getent group "$GROUP_NAME" &>/dev/null; then
     groupadd --system "$GROUP_NAME"
-    ok "created system group '$GROUP_NAME'"
+    ok "created group $GROUP_NAME"
+else
+    ok "group $GROUP_NAME exists"
 fi
 
-# ── 5. Create directories and set permissions ──────────────────────
-log "setting up directories"
-
-# /etc/meshlink — config dir (group writable so meshlink can write config on register)
-mkdir -p "$CONFIG_DIR"
-chown "root:$GROUP_NAME" "$CONFIG_DIR"
-chmod 2775 "$CONFIG_DIR"
-ok "$CONFIG_DIR (root:$GROUP_NAME 2775)"
-
-# Fix existing files in config dir
-for f in "$CONFIG_DIR"/*.toml "$CONFIG_DIR"/credentials.json; do
-    if [[ -f "$f" ]]; then
-        chown "root:$GROUP_NAME" "$f"
-        chmod 0664 "$f"
-    fi
-done
-
-# /var/run — PID file and socket (needs to be writable)
-# Create meshlink-specific runtime dir
-mkdir -p "$PID_DIR"
-# We can't change /var/run ownership, but we can make the specific files group-writable
-# by pre-creating them
-for runtime_file in "$PID_DIR/meshlink.pid" "$PID_DIR/meshlink.sock"; do
-    touch "$runtime_file"
-    chown "root:$GROUP_NAME" "$runtime_file"
-    chmod 0664 "$runtime_file"
-done
-ok "$PID_DIR/meshlink.{pid,sock} (root:$GROUP_NAME 0664)"
-
-# /var/log/meshlink.log
+# ── 5. Directories ────────────────────────────────────────────────────────────
+log "creating directories..."
+install -d -m 2775 -o root -g "$GROUP_NAME" "$CONFIG_DIR"
+install -d -m 0750 -o root -g "$GROUP_NAME" "$STATE_DIR"
+install -d -m 0750 -o root -g "$GROUP_NAME" "$STATE_DIR/updates"
+install -d -m 0755 -o root -g "$GROUP_NAME" "$RUNTIME_DIR"
 touch "$LOG_FILE"
 chown "root:$GROUP_NAME" "$LOG_FILE"
 chmod 0664 "$LOG_FILE"
-ok "$LOG_FILE (root:$GROUP_NAME 0664)"
+ok "directories ready"
 
-# ── 6. Add user to group ───────────────────────────────────────────
-if [[ -n "$REAL_USER" ]]; then
-    log "adding '$REAL_USER' to group '$GROUP_NAME'"
-    usermod -aG "$GROUP_NAME" "$REAL_USER"
-    ok "user '$REAL_USER' added to '$GROUP_NAME'"
+# ── 6. tmpfiles.d ─────────────────────────────────────────────────────────────
+log "writing /etc/tmpfiles.d/meshlink.conf..."
+cat > /etc/tmpfiles.d/meshlink.conf <<'EOF'
+# meshlink runtime paths — recreated each boot
+d  /var/lib/meshlink          0750  root  meshlink  -
+d  /var/lib/meshlink/updates  0750  root  meshlink  -
+d  /run/meshlink              0755  root  meshlink  -
+f  /run/meshlink/meshlink.pid 0660  root  meshlink  -
+EOF
+systemd-tmpfiles --create /etc/tmpfiles.d/meshlink.conf
+ok "/etc/tmpfiles.d/meshlink.conf"
+
+# ── 7. TUN module ─────────────────────────────────────────────────────────────
+log "ensuring tun kernel module..."
+echo "tun" > /etc/modules-load.d/tun.conf
+if ! lsmod | grep -q '^tun '; then
+    modprobe tun && ok "tun module loaded" || warn "modprobe tun failed (may be built-in)"
+else
+    ok "tun module already loaded"
 fi
 
-# ── Summary ─────────────────────────────────────────────────────────
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo -e "${GREEN}meshlink installed successfully${NC}"
-echo ""
-echo "  Binary:  $INSTALL_PATH"
-echo "  Caps:    cap_net_admin,cap_net_raw,cap_net_bind_service"
-echo "  Config:  $CONFIG_DIR/"
-echo "  Log:     $LOG_FILE"
-if [[ -n "$REAL_USER" ]]; then
-    echo "  User:    $REAL_USER -> group $GROUP_NAME"
+# ═════════════════════════════════════════════════════════════════════════════
+# COORD branch
+# ═════════════════════════════════════════════════════════════════════════════
+if [[ "$MODE" == coord ]]; then
+
+    # System user (coord server runs as meshlink:meshlink)
+    log "ensuring system user 'meshlink'..."
+    if ! id meshlink &>/dev/null; then
+        useradd --system --no-create-home --shell /usr/sbin/nologin \
+                --gid "$GROUP_NAME" meshlink
+        ok "created user meshlink"
+    else
+        ok "user meshlink exists"
+    fi
+
+    # Service unit
+    log "writing meshlink-coord.service..."
+    cat > /etc/systemd/system/meshlink-coord.service <<EOF
+[Unit]
+Description=MeshLink Coordination Server
+After=network-online.target postgresql.service
+Wants=network-online.target
+StartLimitIntervalSec=60s
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=meshlink
+Group=meshlink
+
+ExecStart=$INSTALL_PATH cs --config $CONFIG_DIR/coord.toml start
+
+KillSignal=SIGTERM
+TimeoutStopSec=15s
+Restart=on-failure
+RestartSec=5s
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=meshlink-coord
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=$CONFIG_DIR $STATE_DIR /etc/caddy
+
+PrivateNetwork=no
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    ok "/etc/systemd/system/meshlink-coord.service"
+
+    systemctl daemon-reload
+    systemctl enable meshlink-coord
+    ok "meshlink-coord enabled (not started)"
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo -e "${GREEN}coord installation complete${NC}"
+    echo ""
+    echo "  Next steps:"
+    echo ""
+    echo "  1. Write $CONFIG_DIR/coord.toml"
+    echo "     (see docs — set [server] external_address, [database] url, [admin] token, etc.)"
+    echo ""
+    echo "  2. Set up the database:"
+    echo "       $INSTALL_PATH cs --config $CONFIG_DIR/coord.toml db-setup"
+    echo ""
+    echo "  3. Start the service:"
+    echo "       systemctl start meshlink-coord"
+    echo ""
+    echo "  4. Create an invite for peers:"
+    echo "       $INSTALL_PATH cs --config $CONFIG_DIR/coord.toml create-invite"
+    echo ""
+    echo "  Logs:  journalctl -u meshlink-coord -f"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PEER branch
+# ═════════════════════════════════════════════════════════════════════════════
+else
+
+    # Add calling user to meshlink group
+    if [[ -n "$REAL_USER" ]]; then
+        log "adding '$REAL_USER' to group '$GROUP_NAME'..."
+        usermod -aG "$GROUP_NAME" "$REAL_USER"
+        ok "$REAL_USER -> $GROUP_NAME"
+    fi
+
+    # Service unit
+    log "writing meshlink-peer.service..."
+    cat > /etc/systemd/system/meshlink-peer.service <<EOF
+[Unit]
+Description=MeshLink Peer Node
+After=network-online.target systemd-modules-load.service
+Wants=network-online.target
+StartLimitIntervalSec=120s
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=$GROUP_NAME
+Group=$GROUP_NAME
+
+ExecStartPre=-/sbin/ip link delete meshlink0
+ExecStart=$INSTALL_PATH up --foreground
+
+KillSignal=SIGTERM
+TimeoutStopSec=15s
+Restart=on-failure
+RestartSec=10s
+
+RuntimeDirectory=meshlink
+RuntimeDirectoryMode=0750
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=meshlink-peer
+
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=$CONFIG_DIR /var/run
+
+DeviceAllow=/dev/net/tun rw
+DevicePolicy=closed
+
+PrivateNetwork=no
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    ok "/etc/systemd/system/meshlink-peer.service"
+
+    systemctl daemon-reload
+    systemctl enable meshlink-peer
+    ok "meshlink-peer enabled (not started)"
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo -e "${GREEN}peer installation complete${NC}"
+    echo ""
+    echo "  Next steps:"
+    echo ""
+    echo "  1. Register with the coordination server:"
+    echo "       sudo $INSTALL_PATH up \\"
+    echo "         --server https://<coord-domain> \\"
+    echo "         --invite <token>"
+    echo ""
+    echo "  2. Start the service:"
+    echo "       systemctl start meshlink-peer"
+    echo ""
+    if [[ -n "$REAL_USER" ]]; then
+        echo "  Note: log out and back in for the group change to take effect,"
+        echo "        then you can run meshlink without sudo."
+        echo ""
+    fi
+    echo "  Logs:  journalctl -u meshlink-peer -f"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
 fi
-echo ""
-echo "You may need to log out and back in for the group change to take effect."
-echo "Then you can run meshlink without sudo:"
-echo ""
-echo "  meshlink cs db-setup"
-echo "  meshlink cs create-invite"
-echo "  meshlink cs start"
-echo "  meshlink up --server http://<host>:4001 --invite <code>"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

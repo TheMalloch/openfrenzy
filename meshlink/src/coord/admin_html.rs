@@ -240,7 +240,7 @@ async function doLogin(tok) {
   }
 
   token = tok;
-  localStorage.setItem('ml_admin_token', tok);
+  sessionStorage.setItem('ml_admin_token', tok);
   showMain();
   setupSse();
 }
@@ -248,7 +248,7 @@ async function doLogin(tok) {
 authBtn.addEventListener('click', () => doLogin(tokIn.value.trim()));
 tokIn.addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(tokIn.value.trim()); });
 document.getElementById('logout-btn').addEventListener('click', () => {
-  localStorage.removeItem('ml_admin_token');
+  sessionStorage.removeItem('ml_admin_token');
   token = '';
   showAuth('');
 });
@@ -288,6 +288,13 @@ function teardownSse() {
 }
 
 // ── Render ───────────────────────────────────────────────────────────
+// Every server-supplied value is peer-influenced (names, endpoints) and must
+// be escaped before it goes into innerHTML.
+const ESC = {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};
+function esc(v) {
+  return String(v ?? '').replace(/[&<>"']/g, c => ESC[c]);
+}
+
 function relTime(iso) {
   if (!iso) return '—';
   const sec = Math.floor((Date.now() - new Date(iso)) / 1000);
@@ -305,7 +312,7 @@ function statusClass(s) {
 function renderPorts(ports) {
   if (!ports || !ports.length) return '<span class="no-range">no range</span>';
   return '<div class="ports">' + ports.map(p =>
-    `<span class="port ${p.up?'port-up':'port-dn'}">${p.port}</span>`
+    `<span class="port ${p.up?'port-up':'port-dn'}">${esc(p.port)}</span>`
   ).join('') + '</div>';
 }
 
@@ -355,11 +362,11 @@ function applySnapshot(list) {
       JSON.stringify(prevPeers[p.node_id].ports) !== JSON.stringify(p.ports);
 
     const html = `
-      <td><b>${p.node_name||'—'}</b><br><span style="color:var(--g3);font-size:10px">${p.node_id.slice(0,8)}</span></td>
-      <td>${bare}</td>
-      <td><span class="st ${statusClass(p.status)}">${p.status.toUpperCase()}</span></td>
-      <td>${relTime(p.last_heartbeat)}</td>
-      <td style="font-size:11px;color:var(--g2)">${p.endpoint||'—'}</td>
+      <td><b>${esc(p.node_name||'—')}</b><br><span style="color:var(--g3);font-size:10px">${esc(p.node_id.slice(0,8))}</span></td>
+      <td>${esc(bare)}</td>
+      <td><span class="st ${statusClass(p.status)}">${esc(p.status.toUpperCase())}</span></td>
+      <td>${esc(relTime(p.last_heartbeat))}</td>
+      <td style="font-size:11px;color:var(--g2)">${esc(p.endpoint||'—')}</td>
       <td>${renderPorts(p.ports)}</td>
     `;
 
@@ -417,7 +424,7 @@ function tick(msg) {
 
 // ── Boot ─────────────────────────────────────────────────────────────
 (function boot() {
-  const saved = localStorage.getItem('ml_admin_token');
+  const saved = sessionStorage.getItem('ml_admin_token');
   if (saved && clientSideCheck(saved)) {
     tokIn.value = saved;
     doLogin(saved);

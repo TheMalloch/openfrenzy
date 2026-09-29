@@ -1,7 +1,6 @@
 pub mod auth;
 pub mod handlers;
 pub mod html;
-pub mod replay;
 pub mod tls;
 
 use crate::config::PeerApiConfig;
@@ -21,7 +20,6 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::info;
 
 use auth::RateLimiter;
-use replay::NonceStore;
 
 // --- State ---
 
@@ -38,7 +36,6 @@ pub struct PeerApiState {
     pub credentials_path: PathBuf,
     pub coord_client: reqwest::Client,
     pub rate_limiter: Arc<Mutex<RateLimiter>>,
-    pub nonce_store: Arc<Mutex<NonceStore>>,
     pub virtual_ip: Ipv4Addr,
     pub start_time: Instant,
     pub port: u16,
@@ -81,12 +78,14 @@ pub async fn run(
     shared_state: SharedState,
     virtual_ip: Ipv4Addr,
     creds_path: PathBuf,
-    _coord_url: String,
+    coord_token: Option<Arc<RwLock<String>>>,
 ) -> Result<()> {
-    let creds = Credentials::load(creds_path.parent().unwrap_or(std::path::Path::new(".")))
+    let creds = Credentials::load_from(&creds_path)
         .context("loading credentials for peer API")?;
 
-    let write_token = creds.auth_token.clone();
+    // Same Arc as the discovery HTTP fallback, so rotation reaches both.
+    let write_token =
+        coord_token.unwrap_or_else(|| Arc::new(RwLock::new(creds.auth_token.clone())));
 
     let bind_cidr: Option<ipnet::IpNet> = config
         .bind_cidr
@@ -97,21 +96,32 @@ pub async fn run(
     let state = Arc::new(PeerApiState {
         shared_state,
         credentials: Arc::new(RwLock::new(creds)),
-        write_token: Arc::new(RwLock::new(write_token)),
+        write_token,
         read_token: config.read_token.clone(),
         bind_cidr,
         credentials_path: creds_path,
+        // Certificates are verified: this client sends the live coordinator
+        // token. A self-signed coordinator needs its CA in the system store.
         coord_client: reqwest::Client::builder()
-            .danger_accept_invalid_certs(true) // coord may use self-signed
+            .timeout(std::time::Duration::from_secs(10))
             .build()
             .context("building HTTP client")?,
         rate_limiter: Arc::new(Mutex::new(RateLimiter::new())),
-        nonce_store: Arc::new(Mutex::new(NonceStore::new())),
         virtual_ip,
         start_time: Instant::now(),
         port: config.port,
         tls_enabled: config.tls_enabled,
         mtls_enabled: config.mtls_enabled,
+    });
+
+    // Lockout entries otherwise accumulate forever (one per source IP).
+    let limiter = state.rate_limiter.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            tick.tick().await;
+            limiter.lock().await.prune();
+        }
     });
 
     let app = router(state);

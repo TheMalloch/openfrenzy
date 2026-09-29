@@ -60,6 +60,11 @@ fn default_tun_name() -> String {
 #[derive(Debug, Deserialize)]
 pub struct CoordinationConfig {
     pub server: String,
+    /// HTTPS base URL for the coordination API (e.g. "https://crd.aoecyber.com").
+    /// When set, the client falls back to HTTP polling if UDP becomes unreachable.
+    pub api_url: Option<String>,
+    /// Node auth token returned at registration, stored here for HTTP fallback auth.
+    pub auth_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -67,6 +72,10 @@ pub struct PeerConfig {
     pub public_key: String,
     pub allowed_ips: Vec<Ipv4Net>,
     pub endpoint: Option<SocketAddr>,
+    /// Hand-configured peer: kept even when the coordination server does not
+    /// list it, and preserved when discovery rewrites the peers section.
+    #[serde(default, rename = "static")]
+    pub static_peer: bool,
 }
 
 impl Config {

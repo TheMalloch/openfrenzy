@@ -144,8 +144,8 @@ pub async fn get_peers(
             virtual_ip: p.virtual_ip.to_string(),
             status: if p.endpoint.is_some() { "active" } else { "pending" }.to_string(),
             endpoint: p.endpoint.map(|a| a.to_string()),
-            tx_bytes: p.tx_bytes,
-            rx_bytes: p.rx_bytes,
+            tx_bytes: p.tx_bytes(),
+            rx_bytes: p.rx_bytes(),
         })
         .collect();
 

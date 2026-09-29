@@ -40,6 +40,11 @@ pub enum Command {
         #[arg(long)]
         coord_server: Option<String>,
 
+        /// Base64-encoded X25519 public key for BYOK registration (used with --invite).
+        /// When provided the coordinator will not generate or store a private key.
+        #[arg(long)]
+        public_key: Option<String>,
+
         /// Run in the foreground instead of daemonizing.
         #[arg(short = 'f', long)]
         foreground: bool,
@@ -181,6 +186,8 @@ pub enum CsAction {
     },
     /// Regenerate Caddy config from database and reload Caddy.
     CaddyRegen,
+    /// Restart the coordination server via systemctl.
+    Restart,
 }
 
 /// Parameters for server-orchestrated mode, resolved from CLI args, credentials, or env vars.
@@ -331,7 +338,7 @@ async fn process_command(cmd: &str, state: &SharedState) -> String {
                 output.push_str(&format!(
                     "  {pub_key_short}... {status} endpoint={endpoint} \
                      tx={} rx={} vip={}\n",
-                    peer.tx_bytes, peer.rx_bytes, peer.virtual_ip
+                    peer.tx_bytes(), peer.rx_bytes(), peer.virtual_ip
                 ));
             }
             output

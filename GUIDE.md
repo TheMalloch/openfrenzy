@@ -1,130 +1,239 @@
 # MeshLink Setup Guide
 
-## Build
+> **Security status:** tunnel traffic is not encrypted yet, peers are identified
+> by UDP source address, and by default the coordination server generates and
+> stores each node's private key. Only use MeshLink on networks you trust until
+> the [roadmap](roadmap/README.md) Phases 1–2 land.
+
+## Build and install
 
 ```bash
 cargo build --release
 ```
 
-The single binary is at `target/release/meshlink`.
+This produces `target/release/meshlink` (node daemon + coordination server) and
+`target/release/mldeploy` (operator tool, §8).
+
+`install.sh` installs `meshlink` to `/usr/local/bin`, sets its capabilities,
+creates the `meshlink` user/group and directories, and writes and enables (but
+does not start) the systemd unit:
+
+```bash
+sudo ./install.sh coord    # coordination server  -> meshlink-coord.service
+sudo ./install.sh peer     # node                 -> meshlink-peer.service
+```
+
+Without an argument it asks (or reads `INSTALL_MODE`).
 
 ---
 
-## 1. Coordination Server Setup
+## 1. Coordination Server
 
-The coordination server is built into the `meshlink` binary. It handles UDP peer discovery, an HTTP REST API for node registration, and server-push peer list updates. It requires a PostgreSQL database.
+The coordination server is built into `meshlink`. It handles UDP peer discovery
+and NAT detection, an HTTP API for registration and administration, and pushes
+peer lists to nodes when membership changes. It requires PostgreSQL.
 
 ### Prerequisites
 
-- A publicly reachable VPS
-- PostgreSQL database
+- A publicly reachable host
+- PostgreSQL
 
-### Database Setup
+### Database
 
 ```bash
-# Create the database and user
 createdb meshlink
 createuser meshlink
-
-# Initialize tables
-export DATABASE_URL="postgres:///meshlink?user=meshlink"
-meshlink cs db-setup
 ```
 
-### Generate a Server Keypair
+Tables are created (and upgraded) by `db-setup`, and again automatically on
+every `cs start`:
 
 ```bash
-meshlink cs key-gen
+meshlink cs --config /etc/meshlink/coord.toml db-setup
 ```
 
-### Create Invite Codes
+### Configuration: `/etc/meshlink/coord.toml`
+
+`meshlink cs` reads `--config` (default `/etc/meshlink/coord.toml`). If that
+file does not exist it falls back to environment variables (below). Every key
+is optional; defaults are shown.
+
+```toml
+[database]
+url = "postgres:///meshlink?user=meshlink"
+
+[network]
+mesh_cidr = "10.0.0.0/24"
+
+[server]
+http_port = 4001
+udp_port = 4000
+bind_address = "[::]"
+# REQUIRED in practice: the public host nodes use to reach UDP port udp_port.
+# Without it (or coord_addr) nodes are told to use 0.0.0.0:4000.
+external_address = "coord.example.com"
+# coord_addr = "coord.example.com:4000"   # overrides external_address:udp_port
+# api_url = "https://coord.example.com"   # HTTPS URL written into node configs
+                                          # (default: https://<caddy.external_domain>)
+
+[admin]
+token = "long-random-secret"   # enables the admin HTTP API and /admin UI
+
+[peers]
+stale_timeout_secs = 120       # no heartbeat this long -> stale, dropped from peer lists
+cleanup_interval_secs = 60
+default_listen_port = 51820
+
+[invites]
+default_expiry_hours = 24      # used by POST /api/v1/admin/invite
+default_max_uses = 1
+
+[logging]
+level = "info"
+
+[ports]                        # per-node port ranges exposed through Caddy
+range_base = 9000
+block_size = 100
+
+[caddy]
+config_path = "/etc/caddy/meshlink.conf"   # fragment, regenerated on changes
+admin_api = "http://localhost:2019"
+external_domain = ""                       # e.g. coord.example.com
+
+[updates]
+dir = "/var/lib/meshlink/updates"
+
+[scanner]
+interval_secs = 30
+```
+
+`[server] tls_cert`, `tls_key` and `[peers] max_peers` are accepted but **not
+implemented**; the HTTP API speaks plain HTTP. Put it behind a TLS reverse
+proxy (see *HTTPS and Caddy* below).
+
+Without a config file, these environment variables are read instead:
+`DATABASE_URL`, `MESH_NETWORK`, `HTTP_PORT`, `UDP_PORT`, `BIND_ADDRESS`,
+`EXTERNAL_ADDRESS`, `COORD_SERVER_ADDR`, `COORD_API_URL`, `ADMIN_TOKEN`,
+`CADDY_EXTERNAL_DOMAIN`, `UPDATES_DIR`, `LOG_LEVEL`.
+Most `cs start` flags (`meshlink cs start --help`) override either source.
+
+### Start
 
 ```bash
-# Single-use invite (default, expires in 24 hours)
+sudo systemctl start meshlink-coord          # installed by install.sh
+# or in the foreground:
+meshlink cs --config /etc/meshlink/coord.toml start
+```
+
+The server listens on:
+- **UDP 4000**: discovery, NAT detection, keepalives, peer list push
+- **TCP 4001**: HTTP API (registration, admin, node HTTP fallback, updates)
+
+```bash
+sudo ufw allow 4000/udp
+sudo ufw allow 4001/tcp   # or only 443 if everything goes through Caddy
+```
+
+### HTTPS and Caddy
+
+Nodes register and fall back to HTTPS through `api_url`, so in production put
+the HTTP API behind Caddy on the same host. The coordinator trusts
+`X-Forwarded-For` / `X-Real-IP` only from a loopback proxy.
+
+`/etc/caddy/Caddyfile` (you write this):
+
+```
+coord.example.com {
+    reverse_proxy localhost:4001
+}
+
+import meshlink.conf
+```
+
+`meshlink.conf` is generated by the coordinator: one site per port in each
+node's port range, proxied to that node's virtual IP. After changes it runs
+`caddy reload --config /etc/caddy/Caddyfile` (falling back to
+`systemctl reload caddy`), so the fragment must be imported by a `Caddyfile`
+in the same directory. `meshlink cs caddy-regen` regenerates it by hand.
+
+### Invite codes
+
+```bash
+# Single-use, expires in 24 hours
 meshlink cs create-invite
 
-# Multi-use invite (up to 10 uses, expires in 48 hours)
+# Up to 10 uses, expires in 48 hours
 meshlink cs create-invite --multi-use --max-uses 10 --expires-hours 48
 
-# Unlimited multi-use invite (expires in 72 hours)
+# Unlimited uses, expires in 72 hours
 meshlink cs create-invite --multi-use --expires-hours 72
 ```
 
-Or via the admin HTTP API:
+Or over the admin API:
+
 ```bash
-# Requires ADMIN_TOKEN environment variable to be set on the server
-curl -X POST http://your-server:4001/api/v1/admin/invite \
+curl -X POST https://coord.example.com/api/v1/admin/invite \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"max_uses": 5, "expires_in_hours": 48}'
 ```
 
-### Start the Server
+### Admin UI
 
-```bash
-export DATABASE_URL="postgres:///meshlink?user=meshlink"
-
-# Optional configuration (shown with defaults)
-export MESH_NETWORK="10.0.0.0/24"
-export HTTP_PORT=4001
-export UDP_PORT=4000
-export ADMIN_TOKEN="your-secret-admin-token"  # enables admin API
-
-meshlink cs start
-```
-
-The server listens on:
-- **UDP 4000** — peer discovery, NAT detection, and peer list push
-- **HTTP 4001** — REST API for registration and invite management
-
-Open both ports in your firewall:
-```bash
-sudo ufw allow 4000/udp
-sudo ufw allow 4001/tcp
-```
+With `[admin] token` set, `https://coord.example.com/admin` shows nodes, status
+and port-scan results live. The token is kept only in the browser tab's session
+storage.
 
 ---
 
-## 2. Node Setup (Server-Orchestrated)
+## 2. Node Setup
 
-This is the recommended workflow. Nodes register with a single command and receive their configuration automatically. When peers join or leave, the server pushes updated peer lists to all connected nodes.
-
-### Register and Start
+### Register and start
 
 ```bash
 sudo meshlink up \
-  --server http://your-server:4001 \
+  --server https://coord.example.com \
   --invite <invite-code> \
   --name my-laptop
 ```
 
-This will:
-1. Register the node with the coordination server
-2. Receive a generated keypair and virtual IP
-3. Save credentials to `/etc/meshlink/credentials.json`
-4. Write config to `/etc/meshlink/config.toml`
-5. Start the daemon
+`--name` may contain only letters, digits, `.`, `_` and `-` (max 64).
 
-On subsequent runs, just:
-```bash
-sudo meshlink up
-```
+This:
+1. Registers with the coordination server
+2. Receives a virtual IP, an auth token and a generated config
+3. Saves credentials to `/etc/meshlink/credentials.json`
+4. Writes `/etc/meshlink/config.toml`
+5. Starts the daemon (in the background, logging to `/var/log/meshlink.log`)
 
-The daemon loads the saved config and connects to the coordination server automatically.
-
-### Override Coordination Server
-
-If the coordination server address changes or you want to use a different one:
-```bash
-sudo meshlink up --coord-server new-server.example.com:4000
-```
-
-### Check Status
+With `install.sh`, run it as a service instead:
 
 ```bash
-sudo meshlink status
-sudo meshlink peers
+sudo systemctl start meshlink-peer     # runs `meshlink up --foreground`
 ```
+
+On later runs just `sudo meshlink up` (or the service).
+
+**Keep your private key off the server:** register with
+`--public-key <base64>` (from `meshlink genkey`). The server then never sees or
+stores the private key; the generated config has no `private_key` line, and you
+must add yours under `[node]`.
+
+### Other node commands
+
+| Command | Description |
+|---|---|
+| `meshlink up -f` | Run in the foreground |
+| `meshlink up --coord-server host:4000` | Override the UDP coordinator address |
+| `meshlink status` | Daemon status and peers |
+| `meshlink peers` | Peers with traffic counters |
+| `meshlink down` | Stop the daemon |
+| `meshlink genkey` | Print a new keypair |
+| `sudo meshlink setup` | Create system dirs, group and permissions |
+| `meshlink -c <path> …` | Use another config file |
+
+`status` and `peers` talk to the daemon over `/run/meshlink/meshlink.sock`
+(or `/var/run/meshlink.sock` outside systemd).
 
 ---
 
@@ -133,70 +242,119 @@ sudo meshlink peers
 ### On the coordination server
 
 ```bash
-export DATABASE_URL="postgres:///meshlink?user=meshlink"
 meshlink cs db-setup
-meshlink cs start
-```
-
-Create a multi-use invite:
-```bash
+sudo systemctl start meshlink-coord
 meshlink cs create-invite --multi-use --max-uses 5
 # -> Invite code: 550e8400-e29b-41d4-a716-446655440000
 ```
 
-### On Node A
+### On Node A and Node B
 
 ```bash
 sudo meshlink up \
-  --server http://your-server:4001 \
+  --server https://coord.example.com \
   --invite 550e8400-e29b-41d4-a716-446655440000 \
-  --name node-a
-```
-
-### On Node B
-
-```bash
-sudo meshlink up \
-  --server http://your-server:4001 \
-  --invite 550e8400-e29b-41d4-a716-446655440000 \
-  --name node-b
+  --name node-a          # node-b on the second machine
 ```
 
 ### Test connectivity
 
-When Node B joins, the server pushes an updated peer list to Node A automatically. Both nodes' config files are rewritten with the new peer.
+When Node B joins, the server pushes an updated peer list to Node A and both
+configs are rewritten.
 
-From Node A:
 ```bash
-ping 10.0.0.2
-```
-
-From Node B:
-```bash
-ping 10.0.0.1
+ping 10.0.0.2   # from Node A
+ping 10.0.0.1   # from Node B
 ```
 
 ---
 
-## 4. Advanced: Static Configuration (Manual)
+## 4. Server-Push Peer Updates
 
-For environments without a coordination server HTTP API, you can configure nodes manually.
+When a node registers, goes stale, or is disabled, the coordination server
+broadcasts an updated peer list to every connected node over UDP. Nodes that
+advertise support receive it as `0x34` chunks that each fit in one
+unfragmented datagram; older nodes get a single `0x32` message.
 
-### Generate a keypair
+On the node:
+- Pushes are accepted only from the coordination server's address
+- Chunked lists are reassembled before anything is applied
+- New peers are added to the routing table and hole-punched
+- Peers no longer listed are removed, except `static = true` peers
+- The config file's `[[peers]]` entries are rewritten to match; other sections
+  and comments are kept
+
+Nodes also poll every 30 s and send keepalives every 25 s, so missed pushes are
+recovered quickly.
+
+### HTTP fallback
+
+If three peer-list requests in a row go unanswered over UDP and
+`[coordination] api_url` + `auth_token` are set, the node switches to HTTPS
+(`/api/v1/node/keepalive`, `/api/v1/node/peers`). Every 5 minutes it retries
+UDP and switches back once the coordinator actually answers.
+
+---
+
+## 5. Admin Commands
+
+All run against the database configured in `coord.toml` / `DATABASE_URL`:
+
+| Command | Description |
+|---|---|
+| `meshlink cs start` | Start the coordination server (UDP + HTTP) |
+| `meshlink cs db-setup` | Create / upgrade tables |
+| `meshlink cs db-wipe` | Drop all tables (destructive!) |
+| `meshlink cs create-invite` | Create an invite code |
+| `meshlink cs list-invites` | List invites |
+| `meshlink cs revoke-invite <code>` | Expire an invite now |
+| `meshlink cs list-peers` | List nodes |
+| `meshlink cs show-peer <id>` | Show one node |
+| `meshlink cs disable-peer <id>` | Disable a node (removed from all peer lists) |
+| `meshlink cs enable-peer <id>` | Re-enable a node |
+| `meshlink cs caddy-regen` | Regenerate the Caddy fragment and reload Caddy |
+| `meshlink cs restart` | `systemctl restart meshlink-coord` |
+| `meshlink cs key-gen` | Print an X25519 keypair (utility; the server itself needs none) |
+
+### Invite flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--multi-use` | `false` | Allow the invite to be used multiple times |
+| `--max-uses <n>` | `0` | Max uses when multi-use (0 = unlimited) |
+| `--expires-hours <n>` | `24` | Hours until the invite expires |
+
+---
+
+## 6. Peer API (optional)
+
+Each node can serve a small HTTP(S) API and status page on its **virtual IP**:
+
+```toml
+[peer_api]
+enabled = true
+port = 4100
+# read_token = "..."             # extra token allowed for GET endpoints
+# bind_cidr = "10.0.0.0/24"      # only accept clients from this range
+# tls_enabled = true             # self-signed unless tls_cert/tls_key are set
+# mtls_enabled = true
+# mtls_ca = "/etc/meshlink/ca.pem"
+```
+
+Endpoints: `/` (page), `GET /api/status`, `GET /api/peers`, `GET /api/config`,
+`POST /api/token/rotate`. The write token is the node's coordinator auth token;
+rotating it updates the coordinator and `credentials.json`, and verifies the
+coordinator's TLS certificate. Failed attempts are rate-limited per IP.
+
+---
+
+## 7. Advanced: Static Configuration
+
+Nodes can be configured by hand. Peers marked `static = true` are never removed
+by discovery and are preserved when it rewrites the file.
 
 ```bash
 meshlink genkey
-```
-
-Output:
-```
-Private key: <base64 string>
-Public key:  <base64 string>
-```
-
-### Create a config file
-
-```bash
 sudo meshlink setup
 sudo nano /etc/meshlink/config.toml
 ```
@@ -209,112 +367,101 @@ virtual_ip = "10.0.0.1/24"
 tun_name = "meshlink0"
 
 [coordination]
-server = "<coord-server-ip>:4000"
+server = "coord.example.com:4000"
 
 [[peers]]
 public_key = "<peer-public-key>"
 allowed_ips = ["10.0.0.2/32"]
-# endpoint is optional — the coord server handles discovery
-# endpoint = "1.2.3.4:51820"
+endpoint = "1.2.3.4:51820"   # optional when the coordinator knows the peer
+static = true
 ```
 
-Each node must have a unique `virtual_ip` on the same subnet:
-
-| Node   | virtual_ip   |
-|--------|------------- |
-| Node A | 10.0.0.1/24  |
-| Node B | 10.0.0.2/24  |
-| Node C | 10.0.0.3/24  |
-
-### Start the daemon
+Each node needs a unique `virtual_ip` on the same subnet. Use `/32` entries in
+`allowed_ips`: wider prefixes do not route correctly yet (see
+[backlog](roadmap/backlog.md)).
 
 ```bash
 sudo meshlink up
-
-# Or with a custom config path
 sudo meshlink -c /path/to/config.toml up
 ```
 
 ---
 
-## 5. Coordination Server Commands
+## 8. Deploying and Updating with `mldeploy`
 
-All coordination server management is via `meshlink cs <subcommand>`:
+`install.sh` does not install `mldeploy`; copy `target/release/mldeploy` to
+`/usr/local/bin` where you need it.
 
-| Command | Description |
-|---------|-------------|
-| `meshlink cs start` | Start the coordination server (UDP + HTTP) |
-| `meshlink cs db-setup` | Create database tables |
-| `meshlink cs db-wipe` | Drop all tables (destructive!) |
-| `meshlink cs key-gen` | Generate and print an X25519 keypair |
-| `meshlink cs create-invite` | Create a new invite code |
+Operator commands (need `--server` and `--admin-token`, or `MESHLINK_SERVER` /
+`MESHLINK_ADMIN_TOKEN`):
 
-### Invite flags
+```bash
+mldeploy peers
+mldeploy push ./app /opt/app --run 'systemctl restart app'
+mldeploy run 'uptime' --filter node-a
+mldeploy self-update
+```
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--multi-use` | `false` | Allow the invite to be used multiple times |
-| `--max-uses <n>` | `0` | Max uses when multi-use (0 = unlimited) |
-| `--expires-hours <n>` | `24` | Hours until the invite expires |
+### Signed updates
+
+Nodes only install updates signed with a key they pin.
+
+```bash
+# Once, on the admin machine. Keep update.key secret.
+mldeploy keygen --out update
+
+# On every node that auto-updates
+sudo install -m 0644 update.pub /etc/meshlink/update.pub
+sudo install -m 0644 systemd/mldeploy-autoupdate.service /etc/systemd/system/
+sudo systemctl enable --now mldeploy-autoupdate
+
+# Publish (admin token required)
+mldeploy --admin-token "$ADMIN_TOKEN" push-update -d "what changed" --key update.key
+```
+
+The auto-update daemon polls every 5 minutes, checks the hash and signature,
+atomically replaces `--dest`, and re-executes itself when it replaced its own
+binary. Without `/etc/meshlink/update.pub` it refuses to start.
 
 ---
 
-## 6. Server-Push Peer Updates
+## 9. Logging
 
-When a new peer registers or an existing peer goes stale, the coordination server automatically broadcasts an updated peer list (`0x32` message) to all connected peers via UDP.
+```bash
+sudo RUST_LOG=meshlink=info  meshlink up -f   # default
+sudo RUST_LOG=meshlink=debug meshlink up -f   # peer lists, keepalives
+sudo RUST_LOG=meshlink=trace meshlink up -f   # every packet
+```
 
-On the client side:
-- The discovery task handles these unsolicited pushes
-- New peers are added to the routing table
-- Stale peers are removed
-- The config file's `[[peers]]` section is rewritten to match
-
-This means nodes stay in sync without polling — topology changes propagate immediately.
+Daemonized nodes log to `/var/log/meshlink.log`; services log to the journal
+(`journalctl -u meshlink-peer -f`, `-u meshlink-coord`, `-u mldeploy-autoupdate`).
 
 ---
 
-## 7. Logging
+## 10. Firewall
 
-Set the `RUST_LOG` environment variable for more detail:
-
-```bash
-# Info level (default)
-sudo RUST_LOG=meshlink=info meshlink up
-
-# Debug level (shows peer list updates, keepalives)
-sudo RUST_LOG=meshlink=debug meshlink up
-
-# Trace level (very verbose, shows every packet)
-sudo RUST_LOG=meshlink=trace meshlink up
-```
-
----
-
-## 8. Firewall
-
-Each node needs its `listen_port` (default 51820) open for UDP:
+Nodes need their `listen_port` open for UDP. If that port is busy the daemon
+takes the next free one, up to `listen_port + 10`:
 
 ```bash
-sudo ufw allow 51820/udp
+sudo ufw allow 51820:51830/udp
 ```
 
-The coordination server needs both ports open:
-
-```bash
-sudo ufw allow 4000/udp   # peer discovery + push
-sudo ufw allow 4001/tcp   # REST API
-```
+The coordination server needs UDP 4000 and its HTTP port (or 443 via Caddy).
 
 ---
 
 ## Notes
 
-- The coordination server never sees your traffic. It only stores public keys and endpoint addresses.
-- In server-orchestrated mode, the server generates keypairs and allocates IPs automatically.
-- TUN device creation requires root or `CAP_NET_ADMIN`. To run without root:
-  ```bash
-  sudo setcap cap_net_admin+ep ./meshlink
-  ```
-- The daemon creates a unix socket at `/var/run/meshlink.sock` for runtime control. The `status` and `peers` commands communicate through it.
-- Credentials are stored at `/etc/meshlink/credentials.json` after registration.
-- IPv6 endpoints are stored in the database when peers connect over IPv6.
+- **The coordination server sees a lot.** It knows every node's public key,
+  endpoints and virtual IP. Unless nodes registered with `--public-key`, it also
+  **stores their private keys**. Tunnel traffic is not yet encrypted, so anyone
+  on the path between nodes can read it.
+- `/etc/meshlink/config.toml` (private key, auth token) and `credentials.json`
+  hold secrets. They are `root:meshlink`, mode `0660`: readable by the
+  `meshlink` services, never by other users. The daemon removes any world
+  access it finds at startup.
+- TUN creation needs root or `CAP_NET_ADMIN`. `install.sh` sets the
+  capabilities; by hand: `sudo setcap cap_net_admin+ep /usr/local/bin/meshlink`.
+- Only IPv4 is carried inside the tunnel. Nodes reachable only over IPv6 are
+  skipped.

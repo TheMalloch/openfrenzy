@@ -1,6 +1,6 @@
 use crate::crypto::transport;
 use crate::net::udp::normalize_addr;
-use crate::state::{RoutedPacket, SharedState};
+use crate::state::{InboundVerdict, RoutedPacket, SharedState};
 use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
 
@@ -50,24 +50,15 @@ pub async fn outbound_router_task(
         };
 
         // Look up which peer owns this destination
-        let peer_key = match state.lookup_route(dest_ip).await {
-            Some(key) => key,
+        let (_peer_key, endpoint, stats) = match state.outbound_target(dest_ip).await {
+            Some(t) => t,
             None => {
                 trace!(%dest_ip, "no route for destination, dropping");
                 continue;
             }
         };
 
-        // Get peer info for endpoint
-        let peer = match state.get_peer(&peer_key).await {
-            Some(p) => p,
-            None => {
-                warn!("peer in route table but not in peer table");
-                continue;
-            }
-        };
-
-        let endpoint = match peer.endpoint {
+        let endpoint = match endpoint {
             Some(ep) => ep,
             None => {
                 debug!(%dest_ip, "peer has no known endpoint, dropping");
@@ -85,7 +76,7 @@ pub async fn outbound_router_task(
         if udp_tx.send(routed).await.is_err() {
             break;
         }
-        state.add_tx_bytes(&peer_key, len).await;
+        stats.add_tx(len);
     }
 }
 
@@ -129,36 +120,24 @@ async fn handle_data_packet(
     // Normalize src in case it's an IPv4-mapped IPv6 address (::ffff:x.x.x.x)
     let src = normalize_addr(src);
 
-    // Find which peer sent this based on the source endpoint
-    let peer_key = {
-        let peers = state.peers.read().await;
-        match peers.values().find(|p| p.endpoint == Some(src)) {
-            Some(p) => p.public_key,
-            None => {
-                debug!(%src, "data packet from unknown endpoint");
-                return;
-            }
+    // Find which peer sent this based on the source endpoint, and verify the
+    // inner source IP is in its allowed_ips.
+    let inner_src = extract_src_ip(plaintext);
+    let stats = match state.inbound_verdict(src, inner_src).await {
+        InboundVerdict::Accept(stats) => stats,
+        InboundVerdict::UnknownEndpoint => {
+            debug!(%src, "data packet from unknown endpoint");
+            return;
+        }
+        InboundVerdict::SourceNotAllowed => {
+            warn!(?inner_src, "packet source IP not in allowed_ips, dropping");
+            return;
         }
     };
 
     let len = plaintext.len() as u64;
-
-    // Verify source IP is in allowed_ips
-    if let Some(src_ip) = extract_src_ip(plaintext) {
-        if let Some(peer) = state.get_peer(&peer_key).await {
-            let allowed = peer
-                .allowed_ips
-                .iter()
-                .any(|net| net.contains(&src_ip));
-            if !allowed {
-                warn!(%src_ip, "packet source IP not in allowed_ips, dropping");
-                return;
-            }
-        }
-    }
-
     if tun_tx.send(plaintext.to_vec()).await.is_err() {
         return;
     }
-    state.add_rx_bytes(&peer_key, len).await;
+    stats.add_rx(len);
 }
