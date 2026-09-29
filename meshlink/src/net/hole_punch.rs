@@ -8,9 +8,14 @@ use tokio::time::{timeout, Duration};
 use tracing::{debug, info, warn};
 
 /// Detected NAT type from STUN-like probing.
+///
+/// A single probe to one server can only tell `None` from `Unknown`; the
+/// mapping-behaviour variants need a second probe address and are kept for
+/// when that exists.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NatType {
-    /// No NAT — public IP matches socket address.
+    /// Public port equals our bound port: no NAT, or a port-preserving NAT.
     None,
     /// Endpoint-independent mapping (full cone / restricted cone).
     /// Hole punching will work.
@@ -82,14 +87,14 @@ pub async fn detect_nat(
                 }
             };
 
-            let local_addr = socket.local_addr()?;
-            let nat_type = if local_addr.ip().is_unspecified() {
-                // Can't compare 0.0.0.0 directly, assume some NAT
-                NatType::EndpointIndependent
-            } else if local_addr == public_endpoint {
+            // The socket is bound to [::], so only the port can be compared.
+            // A single probe cannot tell cone from symmetric NAT; a changed
+            // port only proves there is a NAT.
+            let local_port = socket.local_addr()?.port();
+            let nat_type = if public_endpoint.port() == local_port {
                 NatType::None
             } else {
-                NatType::EndpointIndependent
+                NatType::Unknown
             };
 
             info!(%public_endpoint, ?nat_type, "NAT detection complete");

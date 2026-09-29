@@ -37,7 +37,11 @@ impl Credentials {
             })?;
         }
         let json = serde_json::to_string_pretty(self).context("serializing credentials")?;
-        std::fs::write(path, &json).map_err(|e| {
+        crate::util::write_atomic(path, json.as_bytes(), 0o600).map_err(|e| {
+            let e = match e.downcast::<std::io::Error>() {
+                Ok(io) => io,
+                Err(other) => return other.context(format!("writing credentials to {:?}", path)),
+            };
             if e.kind() == std::io::ErrorKind::PermissionDenied {
                 anyhow::anyhow!(
                     "Permission denied writing {:?}\n\n\

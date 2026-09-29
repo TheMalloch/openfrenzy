@@ -39,7 +39,7 @@ produced this roadmap:
 
 4. **The coordination server holds every node's private key.** Server-side
    keypair generation is the default path (`coord/api.rs:338`), and
-   `migrations/001_init.sql:5` stores it as `private_key_encrypted BYTEA NOT
+   `meshlink/src/coord/db.rs::setup_tables` stores it as `private_key_encrypted BYTEA NOT
    NULL` — which is not encrypted; `coord/api.rs:388` writes raw bytes.
 
 These are **one problem, not four**. Encrypting packets while still identifying

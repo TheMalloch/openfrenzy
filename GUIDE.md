@@ -261,13 +261,24 @@ All coordination server management is via `meshlink cs <subcommand>`:
 
 ## 6. Server-Push Peer Updates
 
-When a new peer registers or an existing peer goes stale, the coordination server automatically broadcasts an updated peer list (`0x32` message) to all connected peers via UDP.
+When a new peer registers or an existing peer goes stale, the coordination server automatically broadcasts an updated peer list to all connected peers via UDP. Nodes that advertise support receive it as `0x34` chunks that each fit in one unfragmented datagram; older nodes get a single `0x32` message.
 
 On the client side:
-- The discovery task handles these unsolicited pushes
+- The discovery task handles these unsolicited pushes (only from the coordination server's address)
+- Chunked lists are reassembled before anything is applied
 - New peers are added to the routing table
-- Stale peers are removed
-- The config file's `[[peers]]` section is rewritten to match
+- Stale peers are removed, except peers marked `static = true` in the config
+- The config file's `[[peers]]` entries are rewritten to match; other sections and comments are kept
+
+To pin a peer that the coordination server does not know about:
+
+```toml
+[[peers]]
+public_key = "base64_encoded_key"
+allowed_ips = ["10.0.0.50/32"]
+endpoint = "203.0.113.7:51820"
+static = true
+```
 
 This means nodes stay in sync without polling — topology changes propagate immediately.
 

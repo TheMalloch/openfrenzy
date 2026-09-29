@@ -18,7 +18,7 @@ use clap::Parser;
 use cli::{Cli, Command};
 use std::path::Path;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -562,18 +562,11 @@ async fn run_daemon(
         config.coordination.api_url = Some(format!("https://{host}"));
     }
 
-    let coord_addr: std::net::SocketAddr = {
-        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&coord_server_str)
-            .await
-            .with_context(|| format!("resolving coordination server '{coord_server_str}'"))?
-            .collect();
-        addrs
-            .iter()
-            .find(|a| a.is_ipv4())
-            .or(addrs.first())
-            .copied()
-            .context("no addresses for coordination server")?
-    };
+    // Resolved in the background (see the discovery spawn below) so a DNS
+    // failure at boot does not stop the data plane. Until it is set, the UDP
+    // reader drops all coordination packets.
+    let coord_addr: Arc<std::sync::OnceLock<std::net::SocketAddr>> =
+        Arc::new(std::sync::OnceLock::new());
 
     // Coordinator auth token, shared by the HTTP fallback and the peer API so a
     // rotation through the peer API takes effect everywhere. credentials.json
@@ -622,7 +615,7 @@ async fn run_daemon(
         udp_socket.clone(),
         channels.udp_to_router_tx,
         coord_tx,
-        coord_addr,
+        coord_addr.clone(),
     ));
 
     let udp_writer = tokio::spawn(net::udp::udp_writer_task(
@@ -647,17 +640,29 @@ async fn run_daemon(
         coord_token.clone(),
     );
 
-    let discovery = tokio::spawn(discovery::discovery_task(
-        shared_state.clone(),
-        identity.clone(),
-        udp_socket.clone(),
-        coord_addr,
-        actual_port,
-        config_path.to_path_buf(),
-        config.node.virtual_ip.addr(),
-        coord_rx,
-        http_fallback,
-    ));
+    let discovery = {
+        let state = shared_state.clone();
+        let identity = identity.clone();
+        let socket = udp_socket.clone();
+        let config_path = config_path.to_path_buf();
+        let virtual_ip = config.node.virtual_ip.addr();
+        tokio::spawn(async move {
+            let addr = resolve_coord_with_retry(&coord_server_str).await;
+            let _ = coord_addr.set(net::udp::normalize_addr(addr));
+            discovery::discovery_task(
+                state,
+                identity,
+                socket,
+                addr,
+                actual_port,
+                config_path,
+                virtual_ip,
+                coord_rx,
+                http_fallback,
+            )
+            .await
+        })
+    };
 
     let cli_listener = tokio::spawn(cli::cli_listener_task(shared_state.clone()));
 
@@ -702,6 +707,28 @@ async fn run_daemon(
 
     info!("MeshLink stopped");
     Ok(())
+}
+
+/// Resolve the coordination server, retrying with backoff until it works.
+/// Prefers IPv4 so the coord server sees our IPv4 source address (peers
+/// without IPv6 can't reach an IPv6-only endpoint).
+async fn resolve_coord_with_retry(server: &str) -> std::net::SocketAddr {
+    let mut backoff = std::time::Duration::from_secs(1);
+    loop {
+        match tokio::net::lookup_host(server).await {
+            Ok(addrs) => {
+                let addrs: Vec<std::net::SocketAddr> = addrs.collect();
+                if let Some(addr) = addrs.iter().find(|a| a.is_ipv4()).or(addrs.first()) {
+                    info!(%server, %addr, "resolved coordination server");
+                    return *addr;
+                }
+                warn!(%server, "coordination server has no addresses, will retry");
+            }
+            Err(e) => warn!(%server, error = %e, ?backoff, "resolving coordination server failed, will retry"),
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(std::time::Duration::from_secs(60));
+    }
 }
 
 /// If an IO error is a permission error, wrap it with a suggestion to run `meshlink setup`.

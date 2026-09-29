@@ -50,15 +50,14 @@ pub async fn bind_udp(listen_port: u16) -> Result<(UdpSocket, u16)> {
 ///
 /// - `0x04` (data packets) → `data_tx` (to inbound router)
 /// - `0x11`, `0x32`, `0x34` (coord protocol responses) → `coord_tx` (to discovery task),
-///   only when they come from `coord_addr`
+///   only when they come from `coord_addr` (normalized; unset = drop)
 /// - everything else → log and drop
 pub async fn udp_reader_task(
     socket: Arc<UdpSocket>,
     data_tx: mpsc::Sender<RoutedPacket>,
     coord_tx: mpsc::Sender<RoutedPacket>,
-    coord_addr: SocketAddr,
+    coord_addr: Arc<std::sync::OnceLock<SocketAddr>>,
 ) {
-    let coord_addr = normalize_addr(coord_addr);
     // Max UDP payload: large peer lists must not be silently truncated.
     let mut buf = vec![0u8; 65536];
 
@@ -89,7 +88,7 @@ pub async fn udp_reader_task(
                     0x11 | 0x32 | 0x34 => {
                         // Anyone can send to our port; only the coordinator may
                         // drive NAT detection or rewrite our peer table.
-                        if src_addr != coord_addr {
+                        if coord_addr.get() != Some(&src_addr) {
                             trace!(%src_addr, msg_type = format!("0x{:02x}", first), "coord packet from non-coord source, dropping");
                             continue;
                         }

@@ -87,7 +87,7 @@ Phase 1 rewrites. Doing both at once makes the security diff harder to review.
 
 ## `private_key_encrypted` column name
 
-`migrations/001_init.sql:5` declares `private_key_encrypted BYTEA NOT NULL`, but
+`meshlink/src/coord/db.rs::setup_tables` declares `private_key_encrypted BYTEA NOT NULL`, but
 `coord/api.rs:388` writes `private_key_opt.map(|k| k.to_vec())` — raw, unencrypted
 key bytes. The name suggests a protection that does not exist.
 
@@ -105,3 +105,29 @@ it still knows the shape of the mesh.
 This is an inherent property of a centralised coordinator, not a bug. Recorded
 so it is a documented property rather than an unexamined assumption. Changing it
 means a fundamentally different discovery design.
+
+---
+
+## Residual risks after the review-findings fixes (`fix/review-findings`)
+
+Mitigations that landed before Phase 1/2 and are **not** the real fix:
+
+- **`PEER_LIST_REQ` is bound to the registering address, not authenticated.**
+  `coord/udp_handler.rs::handle_peer_list_req` only answers a key whose last
+  `REGISTER`/`KEEPALIVE` came from the same source address. Since `REGISTER` is
+  still unauthenticated, anyone who knows a node's public key can register it
+  from their own address and then read the peer list. Phase 2 closes this.
+- **Nodes accept coordinator packets by source address.** `net/udp.rs` only
+  passes `0x11`/`0x32`/`0x34` from the resolved coordinator address. An
+  on-path or source-spoofing attacker can still forge them. Phase 2 should sign
+  or MAC coordinator messages.
+- **`peer_api` has no replay protection.** The unused `NonceStore` was removed
+  rather than wired in. Reconsider together with "`peer_api` security is on the
+  wrong plane" above.
+- **`X-Forwarded-For` is trusted only from loopback.** A reverse proxy on
+  another host is not supported; that would need a `trusted_proxies` setting.
+- **Port ranges and virtual IPs are never reclaimed.** Both stay reserved for
+  every node row, including disabled ones, because nodes are never deleted.
+  A node delete (or explicit release) API is needed before the pools run out.
+- **Caddy reload assumes `/etc/caddy/Caddyfile` imports the fragment.** The
+  main config is taken to be `Caddyfile` next to `caddy.config_path`.

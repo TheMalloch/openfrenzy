@@ -171,7 +171,7 @@ impl Db {
     // --- Node operations ---
 
     /// Insert a new node record.
-    pub async fn insert_node(&self, node: &NodeRecord) -> Result<()> {
+    async fn insert_node_with<'e, E: sqlx::PgExecutor<'e>>(executor: E, node: &NodeRecord) -> Result<()> {
         sqlx::query(
             r#"INSERT INTO nodes (node_id, node_name, public_key, private_key_encrypted,
                virtual_ip, auth_token, status, endpoint, ipv6_endpoint, listen_port,
@@ -193,10 +193,45 @@ impl Db {
         .bind(node.updated_at)
         .bind(node.port_range_start)
         .bind(node.port_range_size)
-        .execute(&self.pool)
+        .execute(executor)
         .await
         .context("inserting node")?;
         Ok(())
+    }
+
+    /// Insert `node` and consume one use of invite `code`, atomically.
+    ///
+    /// The invite is re-checked (not expired, uses left) by the same UPDATE
+    /// that increments it, so concurrent registrations cannot exceed
+    /// `max_uses`. Returns false, inserting nothing, if the invite is no
+    /// longer usable.
+    pub async fn register_node_with_invite(&self, code: &str, node: &NodeRecord) -> Result<bool> {
+        let mut tx = self.pool.begin().await.context("starting registration transaction")?;
+
+        Self::insert_node_with(&mut *tx, node).await?;
+
+        let consumed: Option<(String,)> = sqlx::query_as(
+            r#"UPDATE invites SET
+               use_count = use_count + 1,
+               used_at = COALESCE(used_at, NOW()),
+               used_by_node_id = $1
+               WHERE code = $2
+                 AND expires_at > NOW()
+                 AND (max_uses <= 0 OR use_count < max_uses)
+               RETURNING code"#,
+        )
+        .bind(&node.node_id)
+        .bind(code)
+        .fetch_optional(&mut *tx)
+        .await
+        .context("consuming invite")?;
+
+        if consumed.is_none() {
+            tx.rollback().await.context("rolling back registration")?;
+            return Ok(false);
+        }
+        tx.commit().await.context("committing registration")?;
+        Ok(true)
     }
 
     /// Get a node by its ID.
@@ -352,23 +387,6 @@ impl Db {
             .await
             .context("fetching invite")?;
         Ok(invite)
-    }
-
-    /// Increment the use count of an invite. Sets used_at on first use.
-    pub async fn increment_invite_use(&self, code: &str, node_id: &str) -> Result<()> {
-        sqlx::query(
-            r#"UPDATE invites SET
-               use_count = use_count + 1,
-               used_at = COALESCE(used_at, NOW()),
-               used_by_node_id = $1
-               WHERE code = $2"#,
-        )
-        .bind(node_id)
-        .bind(code)
-        .execute(&self.pool)
-        .await
-        .context("incrementing invite use")?;
-        Ok(())
     }
 
     /// Update a node's status and update updated_at timestamp.

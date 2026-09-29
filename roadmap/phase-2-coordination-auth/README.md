@@ -46,7 +46,7 @@ no gate at all. `handle_keepalive` (line 426) has the same shape.
 `coord/api.rs:338` generates the node's keypair server-side by default, and
 `coord/api.rs:388` stores the private key via
 `private_key_opt.map(|k| k.to_vec())` into
-`migrations/001_init.sql:5`'s `private_key_encrypted BYTEA NOT NULL`.
+`meshlink/src/coord/db.rs::setup_tables`'s `private_key_encrypted BYTEA NOT NULL`.
 
 **The column name is wrong** — the bytes are stored raw, not encrypted.
 

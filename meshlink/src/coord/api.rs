@@ -425,15 +425,19 @@ async fn register(
         port_range_size: Some(port_size as i32),
     };
 
-    // Insert node
-    if let Err(e) = state.db.insert_node(&node_record).await {
-        warn!(error = ?e, "failed to insert node");
-        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
-    }
-
-    // Increment invite use count
-    if let Err(e) = state.db.increment_invite_use(&req.invite_code, &node_id).await {
-        warn!(error = %e, "failed to increment invite use count");
+    // Insert node and consume the invite in one transaction. The checks above
+    // give friendly errors; this one is authoritative under concurrency.
+    match state.db.register_node_with_invite(&req.invite_code, &node_record).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return error_response(StatusCode::BAD_REQUEST, "invite code fully used or expired")
+                .into_response()
+        }
+        Err(e) => {
+            warn!(error = ?e, "failed to insert node");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+                .into_response();
+        }
     }
 
     // Generate config
@@ -1053,9 +1057,17 @@ struct HttpPeerEntry {
     lan_endpoint: Option<String>,
 }
 
-/// Extract the real client IP: prefer X-Real-IP / X-Forwarded-For (set by Caddy),
-/// fall back to the direct TCP connection address.
+/// Extract the real client IP. X-Real-IP / X-Forwarded-For are only trusted
+/// when the connection comes from a local reverse proxy (Caddy on the same
+/// host); from anyone else they are client-controlled and ignored.
 fn real_ip(headers: &HeaderMap, conn: SocketAddr) -> IpAddr {
+    let from_local_proxy = match conn.ip() {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
+    };
+    if !from_local_proxy {
+        return conn.ip();
+    }
     if let Some(v) = headers
         .get("x-real-ip")
         .or_else(|| headers.get("x-forwarded-for"))
@@ -1201,5 +1213,17 @@ mod tests {
         assert_eq!(sanitize_node_name("<img src=x onerror=alert(1)>"), None);
         assert_eq!(sanitize_node_name(""), None);
         assert_eq!(sanitize_node_name(&"a".repeat(65)), None);
+    }
+
+    #[test]
+    fn forwarded_headers_only_trusted_from_loopback() {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "9.9.9.9, 10.0.0.1".parse().unwrap());
+        let direct: SocketAddr = "203.0.113.5:1234".parse().unwrap();
+        let proxy: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let mapped: SocketAddr = "[::ffff:127.0.0.1]:1234".parse().unwrap();
+        assert_eq!(real_ip(&h, direct), direct.ip());
+        assert_eq!(real_ip(&h, proxy), "9.9.9.9".parse::<IpAddr>().unwrap());
+        assert_eq!(real_ip(&h, mapped), "9.9.9.9".parse::<IpAddr>().unwrap());
     }
 }
