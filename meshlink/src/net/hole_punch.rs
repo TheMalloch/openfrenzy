@@ -108,6 +108,27 @@ pub async fn detect_nat(
     }
 }
 
+fn probe_packet(our_public_key: &[u8; 32]) -> Vec<u8> {
+    // Hole punch probe: [0x20][our_public_key: 32 bytes]
+    let mut probe = Vec::with_capacity(33);
+    probe.push(0x20);
+    probe.extend_from_slice(our_public_key);
+    probe
+}
+
+/// Send a single hole-punch probe (keeps an existing NAT mapping open).
+pub async fn send_probe(
+    socket: &Arc<UdpSocket>,
+    peer_endpoint: SocketAddr,
+    our_public_key: &[u8; 32],
+) -> Result<()> {
+    socket
+        .send_to(&probe_packet(our_public_key), peer_endpoint)
+        .await
+        .context("hole punch probe")?;
+    Ok(())
+}
+
 /// Attempt UDP hole punching to a peer's reported public endpoint.
 ///
 /// Sends several probe packets to open NAT mappings. The peer should be
@@ -117,10 +138,7 @@ pub async fn punch_hole(
     peer_endpoint: SocketAddr,
     our_public_key: &[u8; 32],
 ) -> Result<()> {
-    // Hole punch probe: [0x20][our_public_key: 32 bytes]
-    let mut probe = Vec::with_capacity(33);
-    probe.push(0x20);
-    probe.extend_from_slice(our_public_key);
+    let probe = probe_packet(our_public_key);
 
     // Send multiple probes with increasing delays
     for i in 0..5 {

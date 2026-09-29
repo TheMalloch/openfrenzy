@@ -338,7 +338,7 @@ async fn process_command(cmd: &str, state: &SharedState) -> String {
                 output.push_str(&format!(
                     "  {pub_key_short}... {status} endpoint={endpoint} \
                      tx={} rx={} vip={}\n",
-                    peer.tx_bytes, peer.rx_bytes, peer.virtual_ip
+                    peer.tx_bytes(), peer.rx_bytes(), peer.virtual_ip
                 ));
             }
             output

@@ -72,6 +72,10 @@ pub struct PeerConfig {
     pub public_key: String,
     pub allowed_ips: Vec<Ipv4Net>,
     pub endpoint: Option<SocketAddr>,
+    /// Hand-configured peer: kept even when the coordination server does not
+    /// list it, and preserved when discovery rewrites the peers section.
+    #[serde(default, rename = "static")]
+    pub static_peer: bool,
 }
 
 impl Config {

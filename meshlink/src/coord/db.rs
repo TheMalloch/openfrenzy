@@ -274,14 +274,15 @@ impl Db {
         Ok(result.rows_affected())
     }
 
-    /// Update a node's endpoint and heartbeat by its public key (used by UDP registration).
+    /// Refresh a node's heartbeat by its public key (used by UDP registration),
+    /// and set its IPv4 endpoint when one is given (`None` keeps the stored one).
     pub async fn update_endpoint_by_pubkey(
         &self,
         public_key: &[u8],
-        endpoint: &str,
+        endpoint: Option<&str>,
     ) -> Result<bool> {
         let result = sqlx::query(
-            r#"UPDATE nodes SET endpoint = $1, last_heartbeat = NOW(), updated_at = NOW(),
+            r#"UPDATE nodes SET endpoint = COALESCE($1, endpoint), last_heartbeat = NOW(), updated_at = NOW(),
                status = 'active'
                WHERE public_key = $2 AND status IN ('registered', 'active', 'stale')"#,
         )
@@ -428,12 +429,13 @@ impl Db {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Get all allocated port_range_start values for active/registered nodes.
+    /// Get all allocated port_range_start values. Like virtual IPs, a range
+    /// stays reserved for every node that still exists (stale and disabled
+    /// nodes included) so it cannot be handed out twice.
     pub async fn allocated_port_ranges(&self) -> Result<Vec<i32>> {
         let rows: Vec<(i32,)> = sqlx::query_as(
             "SELECT port_range_start FROM nodes \
-             WHERE status IN ('registered', 'active') \
-             AND port_range_start IS NOT NULL",
+             WHERE port_range_start IS NOT NULL",
         )
         .fetch_all(&self.pool)
         .await
@@ -497,11 +499,12 @@ impl Db {
     }
 
     /// Validate a peer bearer token. Returns the node_id when the token belongs to
-    /// an active or registered node, None otherwise.
+    /// a node that is not deregistered, None otherwise. Stale nodes must be
+    /// accepted: their HTTP keepalive is how they become active again.
     pub async fn validate_peer_token(&self, token: &str) -> Result<Option<String>> {
         let row: Option<(String,)> = sqlx::query_as(
             "SELECT node_id FROM nodes \
-             WHERE auth_token = $1 AND status IN ('registered', 'active')",
+             WHERE auth_token = $1 AND status IN ('registered', 'active', 'stale')",
         )
         .bind(token)
         .fetch_optional(&self.pool)

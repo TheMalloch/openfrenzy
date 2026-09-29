@@ -156,14 +156,12 @@ async fn test_state_add_peer_and_lookup() {
     let virtual_ip: std::net::Ipv4Addr = "10.0.0.2".parse().unwrap();
 
     state
-        .add_peer(meshlink::state::PeerInfo {
-            public_key: pub_key,
-            endpoint: Some("1.2.3.4:51820".parse().unwrap()),
+        .add_peer(meshlink::state::PeerInfo::new(
+            pub_key,
+            Some("1.2.3.4:51820".parse().unwrap()),
             virtual_ip,
-            allowed_ips: vec!["10.0.0.2/32".parse().unwrap()],
-            tx_bytes: 0,
-            rx_bytes: 0,
-        })
+            vec!["10.0.0.2/32".parse().unwrap()],
+        ))
         .await;
 
     // Route lookup
@@ -181,14 +179,12 @@ async fn test_state_endpoint_and_stats() {
 
     let pub_key = [2u8; 32];
     state
-        .add_peer(meshlink::state::PeerInfo {
-            public_key: pub_key,
-            endpoint: None,
-            virtual_ip: "10.0.0.3".parse().unwrap(),
-            allowed_ips: vec!["10.0.0.3/32".parse().unwrap()],
-            tx_bytes: 0,
-            rx_bytes: 0,
-        })
+        .add_peer(meshlink::state::PeerInfo::new(
+            pub_key,
+            None,
+            "10.0.0.3".parse().unwrap(),
+            vec!["10.0.0.3/32".parse().unwrap()],
+        ))
         .await;
 
     // No endpoint initially
@@ -202,11 +198,15 @@ async fn test_state_endpoint_and_stats() {
     assert_eq!(peer.endpoint, Some(ep));
 
     // Stats
-    state.add_tx_bytes(&pub_key, 100).await;
-    state.add_rx_bytes(&pub_key, 200).await;
+    let (_, _, stats) = state
+        .outbound_target("10.0.0.3".parse().unwrap())
+        .await
+        .unwrap();
+    stats.add_tx(100);
+    stats.add_rx(200);
     let peer = state.get_peer(&pub_key).await.unwrap();
-    assert_eq!(peer.tx_bytes, 100);
-    assert_eq!(peer.rx_bytes, 200);
+    assert_eq!(peer.tx_bytes(), 100);
+    assert_eq!(peer.rx_bytes(), 200);
 }
 
 #[tokio::test]

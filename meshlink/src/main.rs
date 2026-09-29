@@ -511,14 +511,13 @@ async fn run_daemon(
             .map(|net| net.addr())
             .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
 
-        let peer_info = state::PeerInfo {
-            public_key: pub_key_bytes,
-            endpoint: peer_config.endpoint,
+        let mut peer_info = state::PeerInfo::new(
+            pub_key_bytes,
+            peer_config.endpoint,
             virtual_ip,
-            allowed_ips: peer_config.allowed_ips.clone(),
-            tx_bytes: 0,
-            rx_bytes: 0,
-        };
+            peer_config.allowed_ips.clone(),
+        );
+        peer_info.static_peer = peer_config.static_peer;
         shared_state.add_peer(peer_info).await;
     }
 
@@ -576,23 +575,34 @@ async fn run_daemon(
             .context("no addresses for coordination server")?
     };
 
+    // Coordinator auth token, shared by the HTTP fallback and the peer API so a
+    // rotation through the peer API takes effect everywhere. credentials.json
+    // is what rotation updates, so it wins over the token in config.toml.
+    let creds_path = config_path
+        .parent()
+        .unwrap_or(std::path::Path::new("/etc/meshlink"))
+        .join("credentials.json");
+    let coord_token: Option<Arc<tokio::sync::RwLock<String>>> =
+        credentials::Credentials::load_from(&creds_path)
+            .ok()
+            .map(|c| c.auth_token)
+            .or_else(|| config.coordination.auth_token.clone())
+            .map(|t| Arc::new(tokio::sync::RwLock::new(t)));
+
     // Spawn peer API (optional, bound to the mesh virtual IP)
     if config.peer_api.enabled {
         let peer_api_config = config.peer_api.clone();
         let peer_api_state = shared_state.clone();
         let peer_api_vip = config.node.virtual_ip.addr();
-        let peer_api_creds = config_path
-            .parent()
-            .unwrap_or(std::path::Path::new("/etc/meshlink"))
-            .join("credentials.json");
-        let peer_api_coord = config.coordination.server.clone();
+        let peer_api_creds = creds_path.clone();
+        let peer_api_token = coord_token.clone();
         tokio::spawn(async move {
             if let Err(e) = peer_api::run(
                 peer_api_config,
                 peer_api_state,
                 peer_api_vip,
                 peer_api_creds,
-                peer_api_coord,
+                peer_api_token,
             )
             .await
             {
@@ -634,7 +644,7 @@ async fn run_daemon(
 
     let http_fallback = discovery::build_http_fallback(
         config.coordination.api_url.clone(),
-        config.coordination.auth_token.clone(),
+        coord_token.clone(),
     );
 
     let discovery = tokio::spawn(discovery::discovery_task(

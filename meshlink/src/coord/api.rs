@@ -22,7 +22,6 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Instant;
 use tokio::net::UdpSocket;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
@@ -582,6 +581,13 @@ async fn disable_peer(
     match state.db.set_node_status(&id, "deregistered").await {
         Ok(()) => {
             info!(node_id = %id, "peer disabled");
+            // Drop it from the live registry so it stops receiving pushed
+            // peer lists; UDP messages from a disabled key are ignored.
+            if let Ok(Some(node)) = state.db.get_node(&id).await {
+                if let Ok(key) = <[u8; 32]>::try_from(node.public_key.as_slice()) {
+                    state.peer_map.lock().await.remove(&key);
+                }
+            }
             regen_caddy(&state).await;
             udp_handler::broadcast_peer_list(&state.udp_socket, &state.peer_map, &state.db).await;
             StatusCode::OK.into_response()
@@ -1103,16 +1109,12 @@ async fn http_keepalive(
         let mut key = [0u8; 32];
         key.copy_from_slice(&node.public_key);
         let mut map = state.peer_map.lock().await;
-        let entry = map.entry(key).or_insert_with(|| udp_handler::RegisteredPeer {
-            public_key: key,
-            endpoint,
-            listen_port: req.listen_port,
-            last_seen: Instant::now(),
-            virtual_ip: node.virtual_ip.split('/').next().and_then(|s| s.parse().ok()),
-            lan_ip,
-        });
-        entry.last_seen = Instant::now();
-        entry.endpoint = endpoint;
+        let entry = map
+            .entry(key)
+            .or_insert_with(|| udp_handler::RegisteredPeer::new(key, endpoint, req.listen_port));
+        entry.seen_from(endpoint);
+        entry.listen_port = req.listen_port;
+        entry.virtual_ip = node.virtual_ip.split('/').next().and_then(|s| s.parse().ok());
         entry.lan_ip = lan_ip;
     }
 
@@ -1165,8 +1167,10 @@ async fn http_peer_list(
                 let mut key = [0u8; 32];
                 key.copy_from_slice(&p.public_key);
                 let ep = map.get(&key)
-                    .map(|r| r.endpoint.to_string())
-                    .or(p.endpoint.clone());
+                    .and_then(|r| r.v4_endpoint)
+                    .map(|e| e.to_string())
+                    .or(p.endpoint.clone())
+                    .or_else(|| map.get(&key).map(|r| r.endpoint.to_string()));
                 let lan_ep = map.get(&key)
                     .and_then(|r| r.lan_ip.map(|ip| format!("{}:{}", ip, p.listen_port)));
                 (ep, lan_ep)

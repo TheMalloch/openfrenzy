@@ -49,7 +49,7 @@ pub async fn bind_udp(listen_port: u16) -> Result<(UdpSocket, u16)> {
 /// Task: read datagrams from UDP socket, dispatch by packet type.
 ///
 /// - `0x04` (data packets) → `data_tx` (to inbound router)
-/// - `0x11`, `0x32` (coord protocol responses) → `coord_tx` (to discovery task),
+/// - `0x11`, `0x32`, `0x34` (coord protocol responses) → `coord_tx` (to discovery task),
 ///   only when they come from `coord_addr`
 /// - everything else → log and drop
 pub async fn udp_reader_task(
@@ -84,8 +84,9 @@ pub async fn udp_reader_task(
                             break;
                         }
                     }
-                    // Coord protocol responses: NAT detect resp (0x11), peer list resp (0x32)
-                    0x11 | 0x32 => {
+                    // Coord protocol responses: NAT detect resp (0x11), peer list
+                    // resp (0x32), chunked peer list (0x34)
+                    0x11 | 0x32 | 0x34 => {
                         // Anyone can send to our port; only the coordinator may
                         // drive NAT detection or rewrite our peer table.
                         if src_addr != coord_addr {
